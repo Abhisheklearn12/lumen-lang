@@ -63,35 +63,195 @@ loaded from an object file) before it runs.
 The full design rationale is in [`docs/DESIGN.md`](docs/DESIGN.md); the language
 reference is in [`docs/LANGUAGE.md`](docs/LANGUAGE.md).
 
-## Features
+## Current capabilities
 
-- **First-class diagnostics**: error codes (`E0001`..`E0318`), multi-span
-  labels, notes and help, rendered with `miette`. Every phase is
-  error-tolerant and reports as many problems as it can in one run. `lumenc
-  explain <CODE>` prints a worked explanation of any code.
-- **A real type system**: `i64`, `f64`, `bool`, `str`, `unit`, arrays, structs,
-  and tuples; inference for `let`; no implicit conversions; divergence analysis
-  for returns.
-- **Expression-oriented control flow**: `if`/`else`, `while`, counted `for`,
-  `for`-each over arrays, `match` on scalar patterns, and `break`/`continue`.
-- **An optimizer**: function inlining, constant folding, algebraic
-  simplification, and dead-code elimination over HIR, run to a fixpoint, each
-  transformation guarded for soundness.
-- **A mid-level IR**: a CFG of basic blocks with classic data-flow passes
-  (constant folding, copy propagation, common-subexpression elimination,
-  dead-store and dead-code elimination, CFG simplification) and an interpreter
-  that is validated to agree with the stack VM.
-- **A bytecode VM**: stack-based, with call frames, recursion, and runtime error
-  handling; never panics on bad input. A verifier proves stack balance, in-range
-  operands, and call arity before execution.
-- **Ahead-of-time artifacts**: `lumenc build` writes a textual bytecode object
-  file that `lumenc exec` verifies and runs without recompiling from source.
-- **A standard library of builtins**: integer and float math, numeric
-  conversions, and string operations (see the language reference).
-- **Structured observability**: `#[tracing::instrument]` on every phase, plus
-  `lumenc --time` for per-phase timings.
-- **Tested throughout**: unit, property (`proptest`), integration, and
-  regression tests, plus `criterion` benchmarks.
+### Language and syntax
+
+- Hand-written single-pass lexer, no backtracking, linear in source length
+- 16 keywords; primitive type names are contextual identifiers rather than keywords
+- Line comments and nested block comments
+- 64-bit integer and 64-bit float literals
+- String literals with `\n`, `\t`, `\r`, `\0`, `\\` and `\"` escapes
+- Pratt (precedence-climbing) expression parser
+- Functions, top-level constants, and struct declarations
+- `let` bindings with optional type annotation and optional `mut`
+- Assignment and compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`)
+- `if`/`else` as an expression
+- `while` loops
+- Counted `for` loops over a half-open range
+- `for`-each loops over arrays
+- `match` on integer and boolean literals with a wildcard arm
+- `break` and `continue`
+- Blocks as expressions, with an optional tail expression supplying the value
+- Unary arithmetic negation and logical not
+- 13 binary operators, including short-circuiting `&&` and `||`
+- Array literals and indexed read/write
+- Struct literals and field access
+- Tuple literals and positional access
+- Recursive function calls
+
+### Type system
+
+- Full static type checking before any code runs
+- `i64`, `f64`, `bool`, `str`, `unit`
+- Arrays of `i64`, `f64`, `bool` or `str`
+- User-defined structs with named, typed fields
+- Structural tuple types, interned by their element list
+- Type inference for `let` bindings
+- No implicit conversions of any kind
+- Divergence analysis, so a function whose body always returns needs no tail expression
+- Compile-time constant evaluation for `const` items, inlined at each use
+- `match` exhaustiveness checking (a `bool` scrutinee exhausts on `true` plus `false`; anything else needs a wildcard)
+- Distinct tuple arities are distinct types
+- Forward references to structs and functions
+- A dedicated error type that absorbs follow-on errors, so a single bad expression does not cascade through every later check
+
+### Diagnostics
+
+- 30 stable error codes, `E0001` through `E0318`, grouped by phase in blocks of one hundred
+- Codes are append-only; a shipped code's meaning is frozen
+- Multi-span labels: one primary label plus any number of secondary labels
+- Notes and help text on any diagnostic
+- Rendered through `miette` with a fixed, deterministic theme
+- Every front-end phase is error-tolerant and reports many problems in one run
+- Levenshtein "did you mean" suggestions with a length-scaled threshold
+- `lumenc explain <CODE>` prints a worked explanation for all 30 codes
+- Byte-offset spans (8 bytes, `Copy`) attached to every AST and HIR node
+- Offset to `line:column` resolution in `O(log n)` through a precomputed line index
+- Columns counted in Unicode scalar values rather than bytes
+
+### Compiler pipeline
+
+- Eight independently timed phases: lex, parse, resolve, typeck, lower, optimize, codegen, peephole
+- A single `Session` wires the phases together; each phase stays independently testable
+- No phase mutates another phase's output
+- Resolution and type-check results live in side tables keyed by `NodeId`, leaving the AST immutable
+- The front-end always runs to completion for complete diagnostics; lowering runs only when error-free
+- Typed HIR with desugaring: `match` becomes an `if`/`else` chain, compound assignment becomes plain assignment, `for`-each becomes an indexed loop over hidden slots, tuples become structs, constants are inlined
+- Dense `LocalId` allocation per function, parameters first
+- Compilation can stop after any stage for inspection
+
+### Optimization
+
+Over HIR, run to a fixpoint of at most eight iterations:
+
+- Inlining of small, pure, non-recursive expression functions
+- Constant folding
+- Algebraic simplification
+- Dead-code elimination: unreachable code after `return`, `while false`, and unused pure `let` bindings
+- A single shared purity predicate decides what is safe to remove
+- Fully deterministic, so optimized output is reproducible
+
+Over generated bytecode:
+
+- Jump threading through chains of unconditional jumps
+- Push/pop elimination for values that are computed and immediately discarded
+- Exact jump-target remapping; an instruction that is itself a jump target is never removed
+
+### Bytecode and virtual machine
+
+- Typed instruction enum rather than packed bytes
+- Monomorphic arithmetic and ordering opcodes chosen at code generation (`AddInt` versus `AddFloat`), so the VM never inspects operand types for those
+- One structural equality opcode covering every type, the single instruction that does dispatch on the operands
+- Absolute jump targets resolved by backpatching
+- Stack-based VM with one shared operand stack and a frame per active call
+- Locals addressed relative to a frame base, with parameters as the leading slots
+- Recursion
+- Reference-counted strings and arrays; arrays carry reference semantics
+- Structs and tuples represented as arrays at runtime
+- The VM never panics: every failure surfaces as a typed error
+- Runtime errors for division by zero, `i64::MIN / -1` and `i64::MIN % -1`, array index out of bounds, and step-limit exhaustion
+- A 50,000,000 step budget bounds runaway loops so they fail cleanly instead of hanging
+- Program output captured to a string, making execution deterministic and testable
+
+### Bytecode verifier
+
+- Abstract interpretation tracking operand stack height rather than concrete values
+- Proves no stack underflow at any instruction
+- Proves that two control-flow paths reaching the same instruction agree on stack height
+- Proves local slots, string constants, jump targets and call targets all exist
+- Proves a call passes exactly as many arguments as the callee declares
+- Proves control never falls off the end, and every path terminates at a `return`
+- Linear in instruction count
+- Runs automatically before any object file is executed
+
+### Ahead-of-time artifacts
+
+- `lumenc build` writes a line-oriented textual bytecode object file
+- Header line per function, a quoted-and-escaped constants section, one instruction per line
+- Serialization and parsing are exact inverses, enforced by a round-trip test
+- `lumenc exec` loads, verifies, then runs an object file without touching source
+
+### Mid-level IR
+
+- Control-flow graph of basic blocks over virtual registers with explicit terminators
+- `goto`, conditional branch, and return terminators
+- Seven data-flow passes run to a fixpoint: constant folding, algebraic simplification, copy propagation, local common-subexpression elimination, dead-store elimination, dead-code elimination, and CFG simplification
+- CFG simplification drops unreachable blocks, collapses branches whose arms coincide, and threads `goto`-only blocks
+- Side-effecting instructions are never removed by any pass
+- A separate MIR interpreter, differentially tested against the stack VM across 11 programs covering integers, floats, strings, arrays, structs, tuples, recursion, loops, short-circuit operators and builtins, with both engines required to produce identical output
+- Graphviz DOT export of the control-flow graph
+
+### C backend
+
+- Transpiles the scalar subset (`i64`, `f64`, `bool`, `unit`) to a self-contained C99 translation unit
+- Functions, recursion, and all control-flow forms
+- Value-position `if` flattened into explicit temporaries
+- Integer addition, subtraction and multiplication emitted through explicit wrapping helpers, matching VM semantics
+- Forward declarations, so functions may call each other in any order
+- Reports a clear error on `str`, arrays, structs and tuples instead of emitting wrong code
+
+### Tooling and observability
+
+- `lumenc run`, `check`, `fmt`, `build`, `exec`, `dump` and `explain`
+- Nine dump forms: `tokens`, `ast`, `hir`, `hir-opt`, `mir`, `cfg`, `c`, `bytecode`, `verify`
+- `-O0` and `-O1`
+- `--time` for per-phase timings in microseconds
+- `-o` for the output path
+- Source formatter emitting valid, re-parseable Lumen; idempotent and round-tripping, both properties tested
+- Deterministic disassembler that shows instruction indices so jump targets are readable
+- `#[tracing::instrument]` spans on every phase, filtered through `RUST_LOG`
+- Logs go to stderr so they never mix with program output on stdout
+- Exit codes: `0` on success, `1` on a compile or runtime error, `2` on a usage or I/O error
+
+### Standard library
+
+- 39 builtins
+- Printing for `i64`, `f64`, `bool` and `str`
+- Integer math: `abs`, `min`, `max`, `pow_int`, `gcd`, `lcm`, `sign`, `clamp`
+- Float math: `sqrt`, `abs_float`, `floor`, `ceil`, `round`, `pow_float`, `min_float`, `max_float`
+- Numeric conversions: `to_float`, `to_int`
+- String conversions: `int_to_str`, `float_to_str`, `bool_to_str`, `char_to_str`, `parse_int`
+- String queries: `str_len`, `char_at`, `starts_with`, `ends_with`, `contains`, `index_of`
+- String transforms: `substring`, `str_repeat`, `to_upper`, `to_lower`, `trim`
+- Array length via `len`
+
+### Testing and quality
+
+- 328 tests passing: 212 unit tests in the library plus 116 across 11 integration binaries
+- Property tests through `proptest`: lexing arbitrary input never panics and always ends in exactly one `Eof`; every token span is well-formed and in bounds; parsing arbitrary token soup never panics
+- A dedicated regression suite for previously fixed bugs
+- Every example program is verified by the test suite
+- `criterion` benchmarks per phase, plus end-to-end compile and execute
+- `cargo clippy --all-targets --all-features -- -D warnings` passes clean
+- `cargo fmt --check` passes clean
+- Toolchain pinned to Rust 1.96, edition 2024, for reproducible builds
+
+## Not yet implemented
+
+Scope is intentionally incremental. The following are known gaps, not oversights:
+
+- Integer addition, subtraction and multiplication wrap silently on overflow. They do not trap. Only `i64::MIN / -1` and `i64::MIN % -1` raise an overflow error.
+- Arrays hold only `i64`, `f64`, `bool` or `str`. Nested arrays, arrays of structs, and arrays of tuples are rejected.
+- Arrays are constructed from literals only. There is no `push`, no `pop`, and no way to allocate an array whose length is a runtime value.
+- There is no input of any kind. No builtin reads stdin. Programs are pure computation to stdout.
+- `match` patterns are scalar literals and the wildcard. No bindings, no destructuring, no ranges, no or-patterns.
+- The C backend covers the scalar subset only. `str`, arrays, structs and tuples are rejected rather than transpiled.
+- The C backend does not reproduce VM division semantics. It emits plain `/` and `%`, so a division by zero that the VM reports as a clean runtime error becomes undefined behaviour in the generated C (in practice, `SIGFPE`).
+- A recursive struct such as `struct Node { value: i64, next: Node }` passes type checking, though no value of it can ever be constructed because every struct literal must supply all fields and there is no null or optional type.
+- The MIR interpreter is reachable from tests only. `lumenc` has no flag to execute a program on it.
+- No generics, closures, function values, enums, methods, or nested functions.
+- One source file per invocation. There is no module or import system.
 
 ## Using the compiler
 
