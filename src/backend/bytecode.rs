@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::sema::types::Builtin;
+use crate::sema::types::{Builtin, Elem};
 
 /// A shared, mutable array value with reference semantics.
 pub type Array = Rc<RefCell<Vec<Value>>>;
@@ -143,6 +143,15 @@ pub enum Op {
 
     /// Build an array from the top `n` values. `[v0..vn-1] -> [array]`
     MakeArray(u32),
+    /// Pop a length and push an array of that many zero values of the given
+    /// element type. `[int] -> [array]` (errors on a negative or oversized
+    /// length).
+    ///
+    /// The length is a *runtime* value, but the stack effect is one-in
+    /// one-out regardless of it, so the verifier can still prove stack height
+    /// from the program counter alone. That is why this is a separate opcode
+    /// rather than a variable-count [`Op::MakeArray`].
+    NewArray(Elem),
     /// Read `base[index]`. `[array, int] -> [v]` (errors if out of bounds).
     Index,
     /// Store `base[index] = value`, yielding unit. `[array, int, v] -> [unit]`

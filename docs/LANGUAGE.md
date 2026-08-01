@@ -91,6 +91,27 @@ An array literal `[e0, e1, …]` has a primitive element type. Elements are read
 and written with `[index]`; an out-of-bounds index is a runtime error. `len`
 returns the element count. Arrays have reference semantics.
 
+An array can also be allocated at a length that is only known while the program
+runs, which is what a sieve, a DP table, or a histogram needs:
+
+```lumen
+fn zeroes(n: i64) -> [i64] {
+    let xs = array_new_int(n);   // n zeroes
+    xs
+}
+```
+
+Lumen has no generics, so there is one such builtin per element type:
+`array_new_int`, `array_new_float`, `array_new_bool`, and `array_new_str`. Each
+takes a length and returns an array of that many zero values (`0`, `0.0`,
+`false`, or `""`). The result is an ordinary array, indistinguishable from a
+literal of the same type.
+
+A negative length is a runtime error, as is a length above 16,777,216. That
+ceiling is deliberate: it bounds runaway allocation the way the step limit
+bounds runaway looping, so an absurd length fails as a clean error rather than
+by exhausting memory.
+
 ## Tuples
 
 ```lumen
@@ -247,6 +268,10 @@ Each prints its argument followed by a newline.
 | Builtin                     | Signature  |
 |-----------------------------|------------|
 | `len([T])`                  | `-> i64`   |
+| `array_new_int(i64)`        | `-> [i64]` |
+| `array_new_float(i64)`      | `-> [f64]` |
+| `array_new_bool(i64)`       | `-> [bool]`|
+| `array_new_str(i64)`        | `-> [str]` |
 | `str_len(str)`              | `-> i64`   |
 | `substring(str, i64, i64)`  | `-> str`   |
 | `char_at(str, i64)`         | `-> i64`   |

@@ -357,9 +357,17 @@ impl FnCompiler {
             Callee::Builtin(Builtin::Len) => {
                 self.emit(Op::ArrayLen);
             }
-            Callee::Builtin(builtin) => {
-                self.emit(Op::CallBuiltin { builtin, argc });
-            }
+            Callee::Builtin(builtin) => match builtin.new_array_elem() {
+                // So does each `array_new_*`. Its element type is fixed at
+                // compile time, so it rides along as an immediate and the VM
+                // never has to inspect the value it is filling the array with.
+                Some(elem) => {
+                    self.emit(Op::NewArray(elem));
+                }
+                None => {
+                    self.emit(Op::CallBuiltin { builtin, argc });
+                }
+            },
         }
     }
 
