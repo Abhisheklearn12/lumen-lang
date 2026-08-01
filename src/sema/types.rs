@@ -229,11 +229,24 @@ pub enum Builtin {
     // ---- more integer math ----
     /// `lcm(i64, i64) -> i64` - least common multiple (`0` if either is `0`).
     Lcm,
+
+    // ---- array construction ----
+    // Lumen has no generics, so allocating an array is one builtin per element
+    // type rather than a single polymorphic `array_new`. Each yields an array
+    // of `n` zero values, where `n` may be a runtime value.
+    /// `array_new_int(i64) -> [i64]`
+    ArrayNewInt,
+    /// `array_new_float(i64) -> [f64]`
+    ArrayNewFloat,
+    /// `array_new_bool(i64) -> [bool]`
+    ArrayNewBool,
+    /// `array_new_str(i64) -> [str]`
+    ArrayNewStr,
 }
 
 impl Builtin {
     /// Every builtin, used to seed the global name scope.
-    pub const ALL: [Builtin; 39] = [
+    pub const ALL: [Builtin; 43] = [
         Builtin::PrintInt,
         Builtin::PrintFloat,
         Builtin::PrintBool,
@@ -273,6 +286,10 @@ impl Builtin {
         Builtin::ToLower,
         Builtin::Trim,
         Builtin::Lcm,
+        Builtin::ArrayNewInt,
+        Builtin::ArrayNewFloat,
+        Builtin::ArrayNewBool,
+        Builtin::ArrayNewStr,
     ];
 
     /// The name programs call this builtin by.
@@ -317,6 +334,10 @@ impl Builtin {
             Builtin::ToLower => "to_lower",
             Builtin::Trim => "trim",
             Builtin::Lcm => "lcm",
+            Builtin::ArrayNewInt => "array_new_int",
+            Builtin::ArrayNewFloat => "array_new_float",
+            Builtin::ArrayNewBool => "array_new_bool",
+            Builtin::ArrayNewStr => "array_new_str",
         }
     }
 
@@ -329,6 +350,19 @@ impl Builtin {
     /// specially (it cannot be described by a fixed [`Builtin::params`] list).
     pub fn is_generic(self) -> bool {
         matches!(self, Builtin::Len)
+    }
+
+    /// The element type this builtin allocates, if it is one of the
+    /// `array_new_*` family. This is the single mapping from builtin to element
+    /// type, so the code generator does not repeat it.
+    pub fn new_array_elem(self) -> Option<Elem> {
+        Some(match self {
+            Builtin::ArrayNewInt => Elem::Int,
+            Builtin::ArrayNewFloat => Elem::Float,
+            Builtin::ArrayNewBool => Elem::Bool,
+            Builtin::ArrayNewStr => Elem::Str,
+            _ => return None,
+        })
     }
 
     /// The parameter types this builtin accepts. Empty for [generic] builtins.
@@ -364,6 +398,10 @@ impl Builtin {
             }
             Builtin::ParseInt | Builtin::ToUpper | Builtin::ToLower | Builtin::Trim => &[Type::Str],
             Builtin::CharToStr => &[Type::Int],
+            Builtin::ArrayNewInt
+            | Builtin::ArrayNewFloat
+            | Builtin::ArrayNewBool
+            | Builtin::ArrayNewStr => &[Type::Int],
         }
     }
 
@@ -406,6 +444,10 @@ impl Builtin {
             | Builtin::MinFloat
             | Builtin::MaxFloat => Type::Float,
             Builtin::StartsWith | Builtin::EndsWith | Builtin::Contains => Type::Bool,
+            Builtin::ArrayNewInt => Type::Array(Elem::Int),
+            Builtin::ArrayNewFloat => Type::Array(Elem::Float),
+            Builtin::ArrayNewBool => Type::Array(Elem::Bool),
+            Builtin::ArrayNewStr => Type::Array(Elem::Str),
         }
     }
 }

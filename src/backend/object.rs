@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 
 use crate::backend::bytecode::{Chunk, Op, Program};
-use crate::sema::types::Builtin;
+use crate::sema::types::{Builtin, Elem, Type};
 
 /// Serializes a program to object text.
 pub fn to_text(program: &Program) -> String {
@@ -76,6 +76,7 @@ fn op_text(op: &Op) -> String {
         Op::GeFloat => "ge_float".to_string(),
         Op::ConcatStr => "concat_str".to_string(),
         Op::MakeArray(n) => format!("make_array {n}"),
+        Op::NewArray(elem) => format!("new_array {}", elem.ty()),
         Op::Index => "index".to_string(),
         Op::SetIndex => "set_index".to_string(),
         Op::ArrayLen => "array_len".to_string(),
@@ -220,6 +221,15 @@ fn parse_op(line: &str) -> Result<Op, String> {
         "ge_float" => Op::GeFloat,
         "concat_str" => Op::ConcatStr,
         "make_array" => Op::MakeArray(one_u(rest.first().ok_or("missing n")?)?),
+        "new_array" => {
+            // The element type is written as its source type name, so this is
+            // the exact inverse of what `op_text` emitted.
+            let name = rest.first().ok_or("missing element type")?;
+            let elem = Type::from_name(name)
+                .and_then(Elem::of)
+                .ok_or_else(|| format!("unknown array element type `{name}`"))?;
+            Op::NewArray(elem)
+        }
         "index" => Op::Index,
         "set_index" => Op::SetIndex,
         "array_len" => Op::ArrayLen,

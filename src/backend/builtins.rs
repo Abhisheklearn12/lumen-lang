@@ -5,9 +5,12 @@
 //! behaves identically no matter which engine runs the program. Output from the
 //! `print_*` family is appended to the caller's buffer.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::backend::bytecode::Value;
-use crate::backend::vm::{VmError, index_in_bounds};
-use crate::sema::types::Builtin;
+use crate::backend::vm::{MAX_ARRAY_LEN, VmError, index_in_bounds};
+use crate::sema::types::{Builtin, Elem};
 
 /// Evaluates a builtin over already-evaluated arguments, appending any printed
 /// output to `out`. The type checker guarantees argument arity and types, so a
@@ -104,8 +107,47 @@ pub fn eval(builtin: Builtin, args: &[Value], out: &mut String) -> Result<Value,
                 .unwrap_or_default();
             Value::Str(s.into())
         }
+        // ---- array construction ----
+        (Builtin::ArrayNewInt, [Value::Int(n)]) => new_array(Elem::Int, *n)?,
+        (Builtin::ArrayNewFloat, [Value::Int(n)]) => new_array(Elem::Float, *n)?,
+        (Builtin::ArrayNewBool, [Value::Int(n)]) => new_array(Elem::Bool, *n)?,
+        (Builtin::ArrayNewStr, [Value::Int(n)]) => new_array(Elem::Str, *n)?,
         _ => return Err(bad()),
     })
+}
+
+/// Allocates an array of `len` zero values of element type `elem`.
+///
+/// This is the one definition of what `array_new_*` means. The stack VM
+/// reaches it through [`Op::NewArray`](crate::backend::bytecode::Op::NewArray)
+/// and the MIR interpreter through [`eval`] above, so the two engines cannot
+/// drift apart.
+///
+/// A negative length is a program error. An excessive one is refused rather
+/// than handed to the allocator, so it fails as a [`VmError`] instead of
+/// aborting the process.
+pub fn new_array(elem: Elem, len: i64) -> Result<Value, VmError> {
+    if len < 0 {
+        return Err(VmError::NegativeArrayLength(len));
+    }
+    if len > MAX_ARRAY_LEN {
+        return Err(VmError::ArrayTooLong {
+            len,
+            max: MAX_ARRAY_LEN,
+        });
+    }
+    let items = vec![zero_value(elem); len as usize];
+    Ok(Value::Array(Rc::new(RefCell::new(items))))
+}
+
+/// The zero value an `array_new_*` fills its array with.
+fn zero_value(elem: Elem) -> Value {
+    match elem {
+        Elem::Int => Value::Int(0),
+        Elem::Float => Value::Float(0.0),
+        Elem::Bool => Value::Bool(false),
+        Elem::Str => Value::Str("".into()),
+    }
 }
 
 /// Greatest common divisor of two integers' magnitudes (Euclid's algorithm).

@@ -34,6 +34,10 @@ pub enum VmError {
     IntegerOverflow,
     #[error("array index {index} out of bounds (length {len})")]
     IndexOutOfBounds { index: i64, len: usize },
+    #[error("cannot create an array of negative length {0}")]
+    NegativeArrayLength(i64),
+    #[error("array length {len} exceeds the maximum of {max}")]
+    ArrayTooLong { len: i64, max: i64 },
     #[error("execution exceeded the step limit ({0} steps)")]
     StepLimitExceeded(u64),
     /// An invariant the front-end should guarantee was violated. Indicates a
@@ -54,6 +58,16 @@ pub struct Execution {
 /// Default step budget  generous for real programs, bounded enough that a
 /// runaway loop in a test fails fast.
 pub const DEFAULT_STEP_LIMIT: u64 = 50_000_000;
+
+/// Largest array a program may allocate at runtime.
+///
+/// The step budget bounds runaway *execution*; this bounds runaway
+/// *allocation*, and for the same reason: without it, `array_new_int` of a
+/// huge length asks the allocator for terabytes and the process aborts, which
+/// is neither a [`VmError`] nor something a program can recover from. A fixed
+/// limit also keeps the outcome identical on every machine, rather than
+/// depending on how much memory happens to be free.
+pub const MAX_ARRAY_LEN: i64 = 1 << 24;
 
 /// Executes `program` from its entry point with the default step limit.
 #[tracing::instrument(level = "debug", skip_all)]
@@ -215,6 +229,10 @@ impl Vm<'_> {
                 self.push(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
                     items,
                 ))));
+            }
+            Op::NewArray(elem) => {
+                let len = self.pop_int()?;
+                self.push(crate::backend::builtins::new_array(elem, len)?);
             }
             Op::Index => {
                 let idx = self.pop_int()?;

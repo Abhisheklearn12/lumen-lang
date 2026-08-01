@@ -170,7 +170,9 @@ fn effect(op: &Op) -> Effect {
         LtInt | LeInt | GtInt | GeInt => bin,
         LtFloat | LeFloat | GtFloat | GeFloat => bin,
         ConcatStr | Eq | Ne => bin,
-        NegInt | NegFloat | NotBool | ArrayLen => unary,
+        // `NewArray` consumes a length and produces an array, so it is
+        // one-in one-out however long the array turns out to be.
+        NegInt | NegFloat | NotBool | ArrayLen | NewArray(_) => unary,
         MakeArray(n) => Effect {
             needed: *n as usize,
             delta: 1 - *n as isize,

@@ -61,6 +61,7 @@ fn render_op(op: &Op, chunk: &crate::backend::bytecode::Chunk) -> String {
         Op::GeFloat => "ge.f".to_string(),
         Op::ConcatStr => "concat".to_string(),
         Op::MakeArray(n) => format!("make_array {n}"),
+        Op::NewArray(elem) => format!("new_array {}", elem.ty()),
         Op::Index => "index".to_string(),
         Op::SetIndex => "set_index".to_string(),
         Op::ArrayLen => "array_len".to_string(),
