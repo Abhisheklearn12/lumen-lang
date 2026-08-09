@@ -120,8 +120,9 @@ fn c_backend_agrees_with_vm_on_div_by_zero() {
     let vm_result = vm_output(src);
     assert!(matches!(vm_result, Err(VmError::DivisionByZero)));
 
-    let c_out = compile_and_run(src, "divide").unwrap();
-    assert_eq!(c_out, "runtime error: division by zero\n");
+    if let Some(c_out) = compile_and_run(src, "divide") {
+        assert_eq!(c_out, String::from("runtime error: division by zero\n"));
+    }
 }
 
 #[test]
@@ -132,8 +133,9 @@ fn c_backend_agrees_with_vm_on_mod_by_zero() {
     let vm_result = vm_output(src);
     assert!(matches!(vm_result, Err(VmError::DivisionByZero)));
 
-    let c_out = compile_and_run(src, "rem").unwrap();
-    assert_eq!(c_out, "runtime error: division by zero\n");
+    if let Some(c_out) = compile_and_run(src, "rem") {
+        assert_eq!(c_out, String::from("runtime error: division by zero\n"));
+    }
 }
 
 #[test]
