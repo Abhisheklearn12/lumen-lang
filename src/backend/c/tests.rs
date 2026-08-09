@@ -5,7 +5,7 @@
 //! agree. Where no compiler is present, the compile-and-run tests are skipped
 //! (the transpilation itself is still checked).
 
-use crate::backend::{CError, emit_c, VmError, execute, generate};
+use crate::backend::{CError, VmError, emit_c, execute, generate};
 use crate::diagnostics::Diagnostics;
 use crate::hir::lower;
 use crate::lexer::tokenize;
