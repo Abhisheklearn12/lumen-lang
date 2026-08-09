@@ -5,7 +5,7 @@
 //! agree. Where no compiler is present, the compile-and-run tests are skipped
 //! (the transpilation itself is still checked).
 
-use crate::backend::{CError, emit_c, execute, generate};
+use crate::backend::{CError, emit_c, VmError, execute, generate};
 use crate::diagnostics::Diagnostics;
 use crate::hir::lower;
 use crate::lexer::tokenize;
@@ -29,9 +29,9 @@ fn hir_of(src: &str) -> crate::hir::Hir {
 }
 
 /// Runs `src` on the VM, returning its stdout.
-fn vm_output(src: &str) -> String {
+fn vm_output(src: &str) -> Result<String, VmError> {
     let program = generate(&hir_of(src));
-    execute(&program).expect("vm run").stdout
+    execute(&program).map(|execution| execution.stdout)
 }
 
 #[test]
@@ -97,7 +97,10 @@ fn compile_and_run(src: &str, name: &str) -> Option<String> {
     let output = std::process::Command::new(&bin_path).output().unwrap();
     let _ = std::fs::remove_file(&c_path);
     let _ = std::fs::remove_file(&bin_path);
-    Some(String::from_utf8(output.stdout).unwrap())
+
+    let mut result = String::from_utf8(output.stdout).unwrap();
+    result.push_str(&String::from_utf8(output.stderr).unwrap());
+    Some(result)
 }
 
 #[test]
@@ -105,8 +108,32 @@ fn c_backend_agrees_with_vm_on_fibonacci() {
     let src = "fn fib(n: i64) -> i64 { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n\
                fn main() { let mut i = 0; while i <= 10 { print_int(fib(i)); i = i + 1; } }";
     if let Some(c_out) = compile_and_run(src, "fib") {
-        assert_eq!(c_out, vm_output(src));
+        assert_eq!(c_out, vm_output(src).expect("vm run: "));
     }
+}
+
+#[test]
+fn c_backend_agrees_with_vm_on_div_by_zero() {
+    let src = "fn divide(a: i64, b: i64) -> i64 { a / b }
+               fn main() { print_int(divide(10, 0)); }";
+
+    let vm_result = vm_output(src);
+    assert!(matches!(vm_result, Err(VmError::DivisionByZero)));
+
+    let c_out = compile_and_run(src, "divide").unwrap();
+    assert_eq!(c_out, "runtime error: division by zero\n");
+}
+
+#[test]
+fn c_backend_agrees_with_vm_on_mod_by_zero() {
+    let src = "fn rem(a: i64, b: i64) -> i64 { a % b }
+               fn main() { print_int(rem(10, 0)); }";
+
+    let vm_result = vm_output(src);
+    assert!(matches!(vm_result, Err(VmError::DivisionByZero)));
+
+    let c_out = compile_and_run(src, "rem").unwrap();
+    assert_eq!(c_out, "runtime error: division by zero\n");
 }
 
 #[test]
@@ -118,6 +145,6 @@ fn c_backend_agrees_with_vm_on_loops_and_arithmetic() {
                \x20   print_bool(total > 1000);\n\
                }";
     if let Some(c_out) = compile_and_run(src, "loops") {
-        assert_eq!(c_out, vm_output(src));
+        assert_eq!(c_out, vm_output(src).expect("vm run: "));
     }
 }
