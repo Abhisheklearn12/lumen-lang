@@ -76,12 +76,14 @@ impl Emitter {
              static inline int64_t lm_mul(int64_t a, int64_t b) { return (int64_t)((uint64_t)a * (uint64_t)b); }\n\
              static inline int64_t lm_div(int64_t a, int64_t b) {
                 if (b == 0) {
+                   fflush(stdout);
                    fprintf(stderr, \"runtime error: division by zero\\n\");
                    exit(1);
                 }
 
                 if (a == INT64_MIN && b == -1) {
-                    fprintf(stderr, \"runtime error: int64 overflow\\n\");
+                    fflush(stdout);
+                    fprintf(stderr, \"runtime error: integer overflow\\n\");
                     exit(1);
                 }
 
@@ -89,12 +91,14 @@ impl Emitter {
             }\n\
             static inline int64_t lm_rem(int64_t a, int64_t b) {
                 if (b == 0) {
+                    fflush(stdout);
                     fprintf(stderr, \"runtime error: division by zero\\n\");
                     exit(1);
                 }
 
                 if (a == INT64_MIN && b == -1) {
-                    fprintf(stderr, \"runtime error: int64 overflow\\n\");
+                    fflush(stdout);
+                    fprintf(stderr, \"runtime error: integer overflow\\n\");
                     exit(1);
                 }
 
