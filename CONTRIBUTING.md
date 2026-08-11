@@ -67,8 +67,10 @@ $ cargo clippy --all-targets --all-features -- -D warnings  # must be clean
 $ cargo fmt --check
 ```
 
-All three must pass before you open a pull request. There is no CI yet, so
-running them locally is the only thing standing between a mistake and `main`.
+All three must pass before you open a pull request. CI runs the same three
+checks on Linux and macOS, and additionally runs the test suite in release
+mode, where overflow checks are off. Finding a problem locally is still
+faster than waiting for a runner.
 
 While working, dumping either side of a phase beats adding print statements:
 
