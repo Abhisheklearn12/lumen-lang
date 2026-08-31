@@ -309,7 +309,26 @@ $ cargo fmt --check
 ```
 
 The project pins a Rust toolchain via `rust-toolchain.toml` (Rust 1.96, edition
-2024) so builds are reproducible.
+2024), so `rustup` gives everyone the same compiler.
+
+### Nix
+
+`rust-toolchain.toml` pins the compiler but not the C compiler that the C
+backend's differential tests shell out to, nor the rest of the environment. For
+a build that is pinned end to end, the repository is a Nix flake:
+
+```console
+$ nix develop                # dev shell: pinned rustc, cargo, clippy, rustfmt, cc, rust-analyzer
+$ nix build                  # build lumenc into ./result/bin/lumenc
+$ nix run . -- run examples/primes.lm    # run without installing anything
+$ nix flake check            # release tests, clippy, and rustfmt in a sandbox
+```
+
+The flake reads `rust-toolchain.toml` itself, so the toolchain version has one
+home and the two paths cannot drift. `flake.lock` pins nixpkgs and the Rust
+overlay; `nix flake update` is the only thing that moves them.
+
+Nix is optional. `cargo` alone remains the supported path, and CI uses it.
 
 ## Project layout
 
