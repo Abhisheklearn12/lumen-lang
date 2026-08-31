@@ -72,6 +72,14 @@ checks on Linux and macOS, and additionally runs the test suite in release
 mode, where overflow checks are off. Finding a problem locally is still
 faster than waiting for a runner.
 
+If you use Nix, `nix develop` drops you into a shell with the pinned toolchain
+and a C compiler already on `PATH`, and `nix flake check` runs clippy, rustfmt,
+and the test suite in a sandbox. It is not a substitute for the three commands
+above: it runs the tests only in release mode, so the debug-mode run that turns
+on overflow checks still has to happen locally or on CI. The flake reads
+`rust-toolchain.toml`, so it never disagrees with the `rustup` path above. Nix
+is optional and CI does not use it; a contribution must not depend on it.
+
 While working, dumping either side of a phase beats adding print statements:
 
 ```console

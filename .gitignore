@@ -1,5 +1,9 @@
 /target
 
+# nix build output symlinks
+/result
+/result-*
+
 # Fore Intellij IDEA
 .idea/
 .*iml/
