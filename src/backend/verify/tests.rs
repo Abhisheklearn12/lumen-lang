@@ -50,6 +50,7 @@ const REAL_PROGRAMS: &[&str] = &[
     "fn main() { for x in [1, 2, 3] { print_int(x); } }",
     r#"fn main() { print_str("hi" + "!"); }"#,
     "fn main() { let a = [1, 2, 3]; a[1] = 9; print_int(a[1] + len(a)); }",
+    "fn main() { let n = 4; let a = array_new_int(n); a[0] = 1; print_int(len(a)); }",
 ];
 
 #[test]

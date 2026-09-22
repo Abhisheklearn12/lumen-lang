@@ -31,6 +31,8 @@ const PROGRAMS: &[&str] = &[
     "fn main() { let mut s = 0; for i in 0..10 { s += i; } print_int(s); }",
     r#"fn main() { print_str("hello, " + "world"); print_float(1.5); }"#,
     "fn main() { let a = [1, 2, 3]; print_int(a[0] + len(a)); }",
+    "fn main() { let n = 2; print_int(len(array_new_int(n)) + len(array_new_float(n))); \
+     print_int(len(array_new_bool(n)) + len(array_new_str(n))); }",
 ];
 
 #[test]
@@ -81,4 +83,11 @@ fn strings_with_escapes_round_trip() {
         execute(&program).unwrap().stdout,
         execute(&parsed).unwrap().stdout
     );
+}
+
+#[test]
+fn rejects_unknown_array_element_type() {
+    let text = "lumen-obj 1 main=0\nfn main params=0 locals=0 consts=0 code=1\n  new_array widget";
+    let err = from_text(text).unwrap_err();
+    assert!(err.contains("unknown array element type `widget`"), "{err}");
 }
