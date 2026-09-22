@@ -50,6 +50,10 @@ const PROGRAMS: &[&str] = &[
     "struct P { x: i64, y: i64 } fn main() { let p = P { x: 3, y: 4 }; print_int(p.x + p.y); }",
     "fn main() { let t = (5, 6); print_int(t.0 * t.1); }",
     "fn main() { print_int(min(3, 9)); print_int(max(3, 9)); print_int(abs(0 - 7)); }",
+    // Runtime-length arrays: the VM runs `Op::NewArray`, MIR calls the builtin.
+    "fn sq(n: i64) -> i64 { n * n }\n\
+     fn main() { let a = array_new_int(sq(3)); for i in 0..len(a) { a[i] = i * 2; } print_int(a[8]); \
+     print_float(array_new_float(2)[1]); print_bool(array_new_bool(1)[0]); print_int(len(array_new_str(4))); }",
 ];
 
 #[test]
@@ -77,4 +81,17 @@ fn out_of_bounds_is_a_runtime_error() {
     optimize(&mut mir);
     let err = interpret(&mir).unwrap_err();
     assert!(err.to_string().contains("out of bounds"));
+}
+
+#[test]
+fn negative_array_length_is_a_runtime_error() {
+    let mut mir = build(&hir_of(
+        "fn main() { let n = 0 - 2; print_int(len(array_new_int(n))); }",
+    ));
+    optimize(&mut mir);
+    let err = interpret(&mir).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "cannot create an array of negative length -2"
+    );
 }
