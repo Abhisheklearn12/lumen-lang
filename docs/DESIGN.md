@@ -85,8 +85,8 @@ Diagnostics are not return values; they are accumulated in a shared
 stopping at the first. Every phase is **error-tolerant**:
 
 - The lexer emits a diagnostic and resynchronises on a bad token.
-- The parser reports an error, skips to a stable boundary (`fn`, `;`, `}`), and
-  continues  guaranteed to make progress so malformed input can never loop.
+- The parser reports an error, skips to a stable boundary (`fn`, `const`, `;`,
+  `}`), and continues, always making progress so malformed input cannot loop.
 - Resolution and type checking report every independent problem; the type
   checker uses a poison `Type::Error` that is compatible with everything, so one
   mistake does not cascade into a flood of follow-on errors.
@@ -111,15 +111,19 @@ provably consistent:
    runtime.
 
 Integer arithmetic uses wrapping semantics in *both* the constant folder and the
-VM, and division/remainder by zero is never folded, so optimized and unoptimized
-builds always produce identical results.
+VM, and a division or remainder that would trap is never folded, so optimized and
+unoptimized builds compute the same integer results. Two known exceptions make
+their output differ: the HIR folder applies `x + 0 → x` and `x * 0 → 0` to
+floats too, which is wrong for `-0.0`, negative, and non-finite values; and DCE
+treats an array read as pure, so an unused out-of-bounds read is deleted instead
+of trapping.
 
 ## Optimization happens at two levels
 
 The HIR optimizer (`opt`) is a pass manager that runs to a bounded fixpoint:
 function inlining of small pure expression functions, constant folding with
 algebraic simplification, and dead-code elimination. Every removal is gated by a
-single `is_pure` predicate, so code with side effects is never dropped.
+single `is_pure` predicate, so a call or a store is never dropped.
 
 The mid-level IR (`mir`) lowers HIR to a control-flow graph of basic blocks with
 single-assignment registers, where classic data-flow optimizations are natural:
@@ -140,18 +144,20 @@ it, and runs it without recompiling from source.
 
 ## Complexity
 
-All phases are linear in the size of their input. The lexer and parser are
-single-pass with no backtracking. Resolution and type checking are single
-post-order walks with `O(1)` amortised scope operations. The optimizer runs a
-fixed set of linear passes to a bounded fixpoint. Code generation is one walk
-with backpatching. Source locations are resolved in `O(log n)` via a binary
-search over a precomputed line index. There are no super-linear algorithms in
-the compiler.
+The phases are close to linear in the size of their input. The lexer and parser
+are single-pass with no backtracking. Resolution collects the top-level names,
+then makes one walk; type checking records signatures, then makes one walk. The
+optimizer runs a fixed set of passes to a bounded fixpoint. Code generation is
+one walk with backpatching. Source locations are resolved in `O(log n)` via a
+binary search over a precomputed line index. A few steps use a linear search
+where inputs are usually small, so they are quadratic in the worst case: string
+constant and tuple type interning, and MIR common-subexpression elimination
+within a block.
 
 ## Safety
 
-The compiler is entirely safe Rust  there is no `unsafe` anywhere  and is
-linted under `clippy -D warnings`. The VM never panics on bad input: genuine
+The compiler is entirely safe Rust, with no `unsafe` anywhere, and is linted
+under `clippy -D warnings`. The VM never panics on bad input: genuine
 program faults become a `VmError`, and situations the front-end makes impossible
 are still handled defensively rather than with `unwrap`. A step limit bounds
 execution so a runaway loop fails cleanly.
@@ -161,7 +167,7 @@ execution so a runaway loop fails cleanly.
 Every phase entry point is annotated with `#[tracing::instrument]` and emits
 structured events (token counts, diagnostic counts, optimization statistics,
 per-phase timings). With `RUST_LOG=lumen=debug` the entire compilation is
-explained through logs, and `lumenc --time` prints a per-phase timing breakdown.
+explained through logs, and `--time` prints a per-phase timing breakdown.
 
 ## Testing strategy
 

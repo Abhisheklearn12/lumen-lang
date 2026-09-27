@@ -1,13 +1,11 @@
-//! A textual object format for compiled [`Program`]s.
+//! A text object format, so a program can be built once (`lumenc build`) and
+//! run later (`lumenc exec`).
 //!
-//! [`to_text`] serializes a program to a compact, line-oriented assembly text,
-//! and [`from_text`] parses it back. This lets a program be compiled once and
-//! run later (`lumenc build` / `lumenc exec`) without recompiling from source.
-//!
-//! The format is deliberately simple and human-readable: a header line per
-//! function, a `consts` section listing string literals (quoted, escaped), and
-//! a `code` section with one instruction per line. [`to_text`] and
-//! [`from_text`] are exact inverses, which a round-trip test enforces.
+//! After a `lumen-obj 1 main=N` header, each function has a `fn` line with its
+//! counts, one quoted `const` line per string constant, and one line per
+//! instruction. [`from_text`] inverts [`to_text`]; a test checks the round
+//! trip. Loaded programs must be [verified](crate::backend::verify()) before
+//! they run.
 
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -15,7 +13,7 @@ use std::rc::Rc;
 use crate::backend::bytecode::{Chunk, Op, Program};
 use crate::sema::types::{Builtin, Elem, Type};
 
-/// Serializes a program to object text.
+/// Writes `program` as object text.
 pub fn to_text(program: &Program) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "lumen-obj 1 main={}", program.main);
@@ -43,7 +41,7 @@ fn write_chunk(out: &mut String, chunk: &Chunk) {
     }
 }
 
-/// Renders one instruction as `mnemonic arg...`.
+/// One instruction as `mnemonic arg...`.
 fn op_text(op: &Op) -> String {
     match op {
         Op::PushInt(v) => format!("push_int {v}"),
@@ -93,7 +91,7 @@ fn op_text(op: &Op) -> String {
     }
 }
 
-/// Parses object text back into a program.
+/// Reads a program from object text. The header's version is not checked.
 pub fn from_text(text: &str) -> Result<Program, String> {
     let mut lines = text.lines();
     let header = lines.next().ok_or("empty object")?;
@@ -172,32 +170,30 @@ fn parse_fn_header(line: &str) -> Result<FnHeader, String> {
     })
 }
 
-/// Parses a single instruction line.
+/// Parses one instruction line.
 fn parse_op(line: &str) -> Result<Op, String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
-    let mnemonic = *tokens.first().ok_or("empty instruction")?;
-    let rest = &tokens[1..];
-    let one_u = |s: &str| s.parse::<u32>().map_err(|_| "bad u32".to_string());
-    let one_usize = |s: &str| s.parse::<usize>().map_err(|_| "bad usize".to_string());
+    let (&mnemonic, rest) = tokens.split_first().ok_or("empty instruction")?;
+    let arg = |i: usize, what: &str| {
+        rest.get(i)
+            .copied()
+            .ok_or_else(|| format!("missing {what}"))
+    };
+    let u32_arg = |i: usize, what: &str| -> Result<u32, String> {
+        arg(i, what)?.parse().map_err(|_| "bad u32".to_string())
+    };
+    let usize_arg = |i: usize, what: &str| -> Result<usize, String> {
+        arg(i, what)?.parse().map_err(|_| "bad usize".to_string())
+    };
 
     Ok(match mnemonic {
-        "push_int" => Op::PushInt(
-            rest.first()
-                .ok_or("missing int")?
-                .parse()
-                .map_err(|_| "bad int")?,
-        ),
-        "push_float" => Op::PushFloat(
-            rest.first()
-                .ok_or("missing float")?
-                .parse()
-                .map_err(|_| "bad float")?,
-        ),
+        "push_int" => Op::PushInt(arg(0, "int")?.parse().map_err(|_| "bad int")?),
+        "push_float" => Op::PushFloat(arg(0, "float")?.parse().map_err(|_| "bad float")?),
         "push_bool" => Op::PushBool(rest.first() == Some(&"true")),
         "push_unit" => Op::PushUnit,
-        "push_str" => Op::PushStr(one_u(rest.first().ok_or("missing idx")?)?),
-        "load_local" => Op::LoadLocal(one_u(rest.first().ok_or("missing n")?)?),
-        "store_local" => Op::StoreLocal(one_u(rest.first().ok_or("missing n")?)?),
+        "push_str" => Op::PushStr(u32_arg(0, "idx")?),
+        "load_local" => Op::LoadLocal(u32_arg(0, "n")?),
+        "store_local" => Op::StoreLocal(u32_arg(0, "n")?),
         "pop" => Op::Pop,
         "add_int" => Op::AddInt,
         "sub_int" => Op::SubInt,
@@ -220,11 +216,10 @@ fn parse_op(line: &str) -> Result<Op, String> {
         "gt_float" => Op::GtFloat,
         "ge_float" => Op::GeFloat,
         "concat_str" => Op::ConcatStr,
-        "make_array" => Op::MakeArray(one_u(rest.first().ok_or("missing n")?)?),
+        "make_array" => Op::MakeArray(u32_arg(0, "n")?),
         "new_array" => {
-            // The element type is written as its source type name, so this is
-            // the exact inverse of what `op_text` emitted.
-            let name = rest.first().ok_or("missing element type")?;
+            // `op_text` writes the element's source type name.
+            let name = arg(0, "element type")?;
             let elem = Type::from_name(name)
                 .and_then(Elem::of)
                 .ok_or_else(|| format!("unknown array element type `{name}`"))?;
@@ -236,19 +231,19 @@ fn parse_op(line: &str) -> Result<Op, String> {
         "eq" => Op::Eq,
         "ne" => Op::Ne,
         "not_bool" => Op::NotBool,
-        "jump" => Op::Jump(one_usize(rest.first().ok_or("missing target")?)?),
-        "jump_if_false" => Op::JumpIfFalse(one_usize(rest.first().ok_or("missing target")?)?),
+        "jump" => Op::Jump(usize_arg(0, "target")?),
+        "jump_if_false" => Op::JumpIfFalse(usize_arg(0, "target")?),
         "call" => Op::Call {
-            func: one_usize(rest.first().ok_or("missing func")?)?,
-            argc: one_u(rest.get(1).ok_or("missing argc")?)? as u8,
+            func: usize_arg(0, "func")?,
+            argc: u32_arg(1, "argc")? as u8,
         },
         "call_builtin" => {
-            let name = rest.first().ok_or("missing builtin")?;
+            let name = arg(0, "builtin")?;
             let builtin =
                 Builtin::from_name(name).ok_or_else(|| format!("unknown builtin `{name}`"))?;
             Op::CallBuiltin {
                 builtin,
-                argc: one_u(rest.get(1).ok_or("missing argc")?)? as u8,
+                argc: u32_arg(1, "argc")? as u8,
             }
         }
         "return" => Op::Return,
@@ -256,7 +251,7 @@ fn parse_op(line: &str) -> Result<Op, String> {
     })
 }
 
-/// Quotes a string constant with escapes the parser understands.
+/// Quotes `s`, escaping `"`, `\\`, newline, tab, and carriage return.
 fn quote(s: &str) -> String {
     let mut out = String::from("\"");
     for ch in s.chars() {
@@ -273,7 +268,7 @@ fn quote(s: &str) -> String {
     out
 }
 
-/// Parses a quoted, escaped string constant, returning a reference-counted str.
+/// Parses a string written by [`quote`].
 fn unquote(s: &str) -> Result<Rc<str>, String> {
     let inner = s
         .strip_prefix('"')

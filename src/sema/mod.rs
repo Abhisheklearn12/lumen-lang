@@ -1,13 +1,12 @@
-//! Semantic analysis: the phases that run between parsing and lowering.
+//! Semantic analysis, between parsing and lowering:
 //!
-//! * [`types`]  the shared [`Type`] representation and [`Builtin`] signatures.
-//! * [`resolve`]  name resolution, binding identifier uses to definitions.
-//! * [`typeck`]  type checking, assigning and verifying types across the AST.
+//! * [`types`]: the [`Type`] representation and [`Builtin`] signatures.
+//! * [`mod@resolve`]: name resolution.
+//! * [`typeck`]: type checking.
 //!
-//! These phases consume the immutable [`Ast`](crate::parser::ast) and produce
-//! side tables (e.g. [`Resolution`]) keyed by
-//! [`NodeId`](crate::parser::ast::NodeId), which later phases read to build a
-//! fully-typed tree.
+//! Both passes read the [`Ast`](crate::parser::ast::Ast) without changing it
+//! and record their results in side tables keyed by
+//! [`NodeId`](crate::parser::ast::NodeId).
 
 pub mod resolve;
 pub mod typeck;

@@ -104,9 +104,9 @@ Breaking one of these needs an explicit argument in the pull request.
 - **Representations stay separate.** Lexer types do not appear in the parser's
   API, AST types do not appear in the backend.
 - **Diagnostic codes are append-only.** A shipped code's meaning is frozen. Add
-  a new one in the right block (`E01xx` lexer, `E02xx` resolution, `E03xx` type
-  checking) and give it an explanation in `src/explain.rs`, which a test
-  enforces for every code.
+  a new one in the right block (`E00xx` lexer, `E01xx` parser, `E02xx`
+  resolution, `E03xx` type checking) and give it an explanation in
+  `src/explain.rs`, which a test enforces for every code.
 - **The VM never panics.** Every runtime failure surfaces as a typed error. An
   `unwrap` on the VM path is a bug even when you believe it cannot fire.
 - **Output is deterministic.** Optimizer, formatter, and disassembler must

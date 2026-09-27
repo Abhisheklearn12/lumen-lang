@@ -30,8 +30,7 @@ fn mir_of(src: &str) -> crate::mir::Program {
     build(&hir)
 }
 
-/// Every block reachable from a function's entry must end in a real terminator
-/// (never `Unreachable`).
+/// Every block must end in a real terminator, never `Unreachable`.
 fn assert_well_formed(program: &crate::mir::Program) {
     for func in &program.functions {
         for (i, block) in func.blocks.iter().enumerate() {

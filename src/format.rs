@@ -1,20 +1,15 @@
-//! The source formatter: turns an [`Ast`] back into canonical Lumen source.
+//! The formatter behind `lumenc fmt`: prints an [`Ast`] as canonical source.
 //!
-//! This powers `lumenc fmt`. Unlike the AST *debug* printer
-//! ([`parser::print`](crate::parser::print)), which emits a tree for inspection,
-//! the formatter emits **valid, re-parseable Lumen code** in a single canonical
-//! style: four-space indentation, one statement per line, spaces around binary
-//! operators, and minimal parentheses driven by operator precedence.
-//!
-//! Formatting is idempotent - running it on already-formatted output is a
-//! no-op - and round-trips: formatting, parsing, and formatting again yields the
-//! same text. Both properties are covered by tests.
+//! Unlike the [AST printer](crate::parser::print), it emits valid Lumen:
+//! four-space indents, one statement per line, spaces around binary operators,
+//! and only the parentheses precedence requires. Comments are not kept, since
+//! the AST has none. Formatting is idempotent; tests check it.
 
 use std::fmt::Write as _;
 
 use crate::parser::ast::*;
 
-/// Formats a whole program to canonical source text.
+/// Formats a whole program.
 pub fn format_source(ast: &Ast) -> String {
     let mut f = Formatter {
         out: String::new(),
@@ -34,25 +29,20 @@ struct Formatter {
     depth: usize,
 }
 
-/// The precedence level of a binary operator, used to parenthesise minimally.
-/// Higher binds tighter; mirrors the parser's `binding_power`.
-fn precedence(op: BinOp) -> u8 {
-    use BinOp::*;
-    match op {
-        Or => 1,
-        And => 2,
-        Eq | Ne => 3,
-        Lt | Le | Gt | Ge => 4,
-        Add | Sub => 5,
-        Mul | Div | Rem => 6,
-    }
-}
+/// The binding strength of prefix `-` and `!`, above every binary operator.
+const PREFIX_PREC: u8 = 7;
+/// The binding strength of calls, indexing, and `.`, the tightest.
+const POSTFIX_PREC: u8 = 8;
 
 impl Formatter {
+    /// The indentation for the current depth.
+    fn pad(&self) -> String {
+        "    ".repeat(self.depth)
+    }
+
     fn indent(&mut self) {
-        for _ in 0..self.depth {
-            self.out.push_str("    ");
-        }
+        let pad = self.pad();
+        self.out.push_str(&pad);
     }
 
     fn line(&mut self, text: &str) {
@@ -105,8 +95,8 @@ impl Formatter {
 
     // ---- blocks & statements ----
 
-    /// Writes a block starting at the current cursor (after `… `) and ending
-    /// with the closing brace on its own line.
+    /// Writes a block from the current position; a non-empty block's `}` goes
+    /// on its own line.
     fn block(&mut self, block: &Block) {
         if block.stmts.is_empty() && block.tail.is_none() {
             self.out.push_str("{}");
@@ -175,17 +165,15 @@ impl Formatter {
 
     // ---- expressions ----
 
-    /// Renders a block expression (used inside `if`/block tails) at the current
-    /// indentation, returning the text.
+    /// A block as text, indented for the current depth.
     fn block_to_string(&mut self, block: &Block) -> String {
         let saved = std::mem::take(&mut self.out);
         self.block(block);
         std::mem::replace(&mut self.out, saved)
     }
 
-    /// Formats an expression to a string. `parent_prec` is the precedence of the
-    /// enclosing binary operator (0 at the top), used to add parentheses only
-    /// when needed to preserve the parse.
+    /// `expr` as text, parenthesised if it binds looser than `parent_prec`,
+    /// the precedence its context requires (0 for none).
     fn expr_to_string(&mut self, expr: &Expr, parent_prec: u8) -> String {
         match &expr.kind {
             ExprKind::Int(v) => v.to_string(),
@@ -194,10 +182,10 @@ impl Formatter {
             ExprKind::Str(s) => format!("{s:?}"),
             ExprKind::Name(n) => n.clone(),
             ExprKind::Unary { op, rhs } => {
-                format!("{}{}", op.symbol(), self.expr_to_string(rhs, 7))
+                format!("{}{}", op.symbol(), self.expr_to_string(rhs, PREFIX_PREC))
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let prec = precedence(*op);
+                let prec = op.precedence();
                 let l = self.expr_to_string(lhs, prec);
                 let r = self.expr_to_string(rhs, prec + 1);
                 let text = format!("{l} {} {r}", op.symbol());
@@ -208,7 +196,7 @@ impl Formatter {
                 }
             }
             ExprKind::Call { callee, args } => {
-                let callee = self.expr_to_string(callee, 8);
+                let callee = self.expr_to_string(callee, POSTFIX_PREC);
                 let args = args
                     .iter()
                     .map(|a| self.expr_to_string(a, 0))
@@ -217,7 +205,7 @@ impl Formatter {
                 format!("{callee}({args})")
             }
             ExprKind::Index { base, index } => {
-                let base = self.expr_to_string(base, 8);
+                let base = self.expr_to_string(base, POSTFIX_PREC);
                 let index = self.expr_to_string(index, 0);
                 format!("{base}[{index}]")
             }
@@ -253,7 +241,7 @@ impl Formatter {
                 format!("{} {{ {parts} }}", name.name)
             }
             ExprKind::Field { base, field } => {
-                format!("{}.{}", self.expr_to_string(base, 8), field.name)
+                format!("{}.{}", self.expr_to_string(base, POSTFIX_PREC), field.name)
             }
             ExprKind::TupleLit(elems) => {
                 let parts = elems
@@ -264,7 +252,7 @@ impl Formatter {
                 format!("({parts})")
             }
             ExprKind::TupleIndex { base, index, .. } => {
-                format!("{}.{index}", self.expr_to_string(base, 8))
+                format!("{}.{index}", self.expr_to_string(base, POSTFIX_PREC))
             }
             ExprKind::If(if_expr) => self.if_to_string(if_expr),
             ExprKind::Match(m) => self.match_to_string(m),
@@ -277,17 +265,11 @@ impl Formatter {
         let mut text = format!("match {scrut} {{\n");
         self.depth += 1;
         for arm in &m.arms {
-            let pat = pattern_str(&arm.pattern);
             let body = self.expr_to_string(&arm.body, 0);
-            for _ in 0..self.depth {
-                text.push_str("    ");
-            }
-            let _ = writeln!(text, "{pat} => {body},");
+            let _ = writeln!(text, "{}{} => {body},", self.pad(), arm.pattern);
         }
         self.depth -= 1;
-        for _ in 0..self.depth {
-            text.push_str("    ");
-        }
+        text.push_str(&self.pad());
         text.push('}');
         text
     }
@@ -304,16 +286,7 @@ impl Formatter {
     }
 }
 
-/// Renders a `match` arm pattern to source form.
-fn pattern_str(pattern: &Pattern) -> String {
-    match pattern {
-        Pattern::Int(v) => v.to_string(),
-        Pattern::Bool(b) => b.to_string(),
-        Pattern::Wild => "_".to_string(),
-    }
-}
-
-/// Renders a syntactic type to source form.
+/// A type as written; `?` for a malformed one.
 fn type_str(ty: &TypeExpr) -> String {
     match &ty.kind {
         TypeExprKind::Named(name) => name.clone(),
@@ -328,8 +301,8 @@ fn type_str(ty: &TypeExpr) -> String {
     }
 }
 
-/// Formats a float so it always round-trips and always reads as a float (a
-/// trailing `.0` is added to whole numbers, which would otherwise lex as `int`).
+/// A float literal that reads back as the same value: whole numbers get `.0`,
+/// which keeps them from lexing as integers.
 fn format_float(v: f64) -> String {
     let s = v.to_string();
     if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {

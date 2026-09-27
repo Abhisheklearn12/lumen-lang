@@ -1,25 +1,11 @@
-//! `lumenc`  the Lumen compiler command-line driver.
+//! `lumenc`, the Lumen command-line driver: argument parsing and I/O around
+//! the [`lumen`] library. `lumenc --help` lists the commands.
 //!
-//! A thin shell over the [`lumen`] library: it parses arguments, initialises
-//! structured logging, builds a [`Session`], and either runs the program or
-//! prints an intermediate representation. All compilation logic lives in the
-//! library; this file only does I/O and presentation.
-//!
-//! ```text
-//! lumenc run   <file.lm>           compile and execute
-//! lumenc check <file.lm>           type-check only, report diagnostics
-//! lumenc dump  <form> <file.lm>    print tokens | ast | hir | hir-opt | bytecode
-//!
-//! options: -O0 (disable opt) | -O1 (default) | --time (phase timings) | -h
-//! ```
-//!
-//! Logging verbosity is controlled by the `RUST_LOG` environment variable
-//! (e.g. `RUST_LOG=lumen=debug`), so the entire compilation is explainable
-//! through `#[tracing::instrument]` spans without any code change.
+//! Logging goes to stderr and is set by `RUST_LOG`, e.g. `RUST_LOG=lumen=debug`.
 
 use std::process::ExitCode;
 
-use lumen::backend::{disassemble, execute};
+use lumen::backend::{Program, disassemble, execute};
 use lumen::hir::print_hir;
 use lumen::opt::OptOptions;
 use lumen::parser::print::print_ast;
@@ -37,34 +23,31 @@ fn main() -> ExitCode {
     }
 }
 
-/// Installs a `tracing` subscriber driven by `RUST_LOG` (default: warnings).
-/// Logs go to stderr so they never mix with program output on stdout.
+/// Logs to stderr, filtered by `RUST_LOG` (default `warn`).
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    // `try_init` so running the binary twice in one process (tests) is harmless.
+    // Tolerate a subscriber that is already installed.
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
 }
 
-/// What the user asked the compiler to do.
 #[derive(Debug)]
 enum Command {
     Run,
     Check,
     Fmt,
     Dump(Stage),
-    /// Compile to a bytecode object file (written to `--output` or stdout).
+    /// Writes an object file to `--output`, or stdout.
     Build,
-    /// Run a previously built bytecode object file.
+    /// Runs an object file.
     Exec,
-    /// Explain a diagnostic code; carries no source file.
+    /// Explains a diagnostic code.
     Explain(String),
 }
 
-/// Parsed command-line arguments.
 #[derive(Debug)]
 struct Cli {
     command: Command,
@@ -75,7 +58,8 @@ struct Cli {
 }
 
 impl Cli {
-    /// Parses arguments (already stripped of the program name).
+    /// Parses the arguments after the program name. `Err` holds the message
+    /// to print above the usage text.
     fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         let mut positional = Vec::new();
         let mut optimize = true;
@@ -102,7 +86,7 @@ impl Cli {
 
         let command_name = positional.first().ok_or("missing command")?.clone();
 
-        // `explain` takes a code, not a source file, so handle it up front.
+        // `explain` takes a code, not a file.
         if command_name == "explain" {
             let code = positional
                 .get(1)
@@ -130,7 +114,6 @@ impl Cli {
             other => return Err(format!("unknown command `{other}`")),
         };
 
-        // The file is the last positional argument.
         let path_index = if matches!(command, Command::Dump(_)) {
             2
         } else {
@@ -193,7 +176,6 @@ OPTIONS:
 ";
 
 fn run(cli: Cli) -> ExitCode {
-    // `explain` needs no source file.
     if let Command::Explain(code) = &cli.command {
         return match lumen::explain::explain(code) {
             Some(text) => {
@@ -207,17 +189,13 @@ fn run(cli: Cli) -> ExitCode {
         };
     }
 
-    // `exec` reads a pre-built object file rather than source.
     if matches!(cli.command, Command::Exec) {
         return exec_object(&cli.path);
     }
 
-    let src = match std::fs::read_to_string(&cli.path) {
+    let src = match read_file(&cli.path) {
         Ok(src) => src,
-        Err(err) => {
-            eprintln!("error: cannot read `{}`: {err}", cli.path);
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
 
     let stop_after = match &cli.command {
@@ -237,7 +215,6 @@ fn run(cli: Cli) -> ExitCode {
     let mut session = Session::new(cli.path.clone(), src);
     let artifacts = session.compile(options);
 
-    // Diagnostics first, regardless of outcome.
     let rendered = session.render_diagnostics();
     if !rendered.is_empty() {
         eprint!("{rendered}");
@@ -264,19 +241,32 @@ fn run(cli: Cli) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Command::Run => execute_program(&artifacts),
+        Command::Run => match &artifacts.program {
+            Some(program) => run_program(program),
+            None => no_program(),
+        },
         Command::Build => build_object(&artifacts, cli.output.as_deref()),
-        // Handled before the source file is read.
         Command::Explain(_) | Command::Exec => unreachable!("handled earlier"),
     }
 }
 
-/// Serializes the compiled program to the bytecode object format, writing it to
-/// `output` (or stdout when `None`).
+/// Reads a file, reporting failure and returning exit code 2.
+fn read_file(path: &str) -> Result<String, ExitCode> {
+    std::fs::read_to_string(path).map_err(|err| {
+        eprintln!("error: cannot read `{path}`: {err}");
+        ExitCode::from(2)
+    })
+}
+
+fn no_program() -> ExitCode {
+    eprintln!("internal error: no program was produced");
+    ExitCode::from(1)
+}
+
+/// Writes the compiled program as an object file to `output`, or stdout.
 fn build_object(artifacts: &lumen::Artifacts, output: Option<&str>) -> ExitCode {
     let Some(program) = &artifacts.program else {
-        eprintln!("internal error: no program was produced");
-        return ExitCode::from(1);
+        return no_program();
     };
     let text = lumen::backend::object::to_text(program);
     match output {
@@ -294,14 +284,11 @@ fn build_object(artifacts: &lumen::Artifacts, output: Option<&str>) -> ExitCode 
     }
 }
 
-/// Loads and runs a bytecode object file.
+/// Loads, verifies, and runs an object file.
 fn exec_object(path: &str) -> ExitCode {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(err) => {
-            eprintln!("error: cannot read `{path}`: {err}");
-            return ExitCode::from(2);
-        }
+    let text = match read_file(path) {
+        Ok(text) => text,
+        Err(code) => return code,
     };
     let program = match lumen::backend::object::from_text(&text) {
         Ok(p) => p,
@@ -310,12 +297,17 @@ fn exec_object(path: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // The object file is untrusted input; verify it before the VM runs it.
+    // An object file is untrusted input.
     if let Err(err) = lumen::backend::verify(&program) {
         eprintln!("error: object file `{path}` failed verification: {err}");
         return ExitCode::from(2);
     }
-    match execute(&program) {
+    run_program(&program)
+}
+
+/// Runs `program`, printing its output, or on a runtime error only the error.
+fn run_program(program: &Program) -> ExitCode {
+    match execute(program) {
         Ok(execution) => {
             print!("{}", execution.stdout);
             ExitCode::SUCCESS
@@ -327,7 +319,7 @@ fn exec_object(path: &str) -> ExitCode {
     }
 }
 
-/// Renders the requested intermediate form to a string.
+/// Renders the intermediate form `stage` names.
 fn render_dump(stage: Stage, artifacts: &lumen::Artifacts) -> String {
     match stage {
         Stage::Tokens => artifacts
@@ -348,20 +340,12 @@ fn render_dump(stage: Stage, artifacts: &lumen::Artifacts) -> String {
         Stage::Mir => artifacts
             .hir
             .as_ref()
-            .map(|hir| {
-                let mut mir = lumen::mir::build(hir);
-                lumen::mir::optimize(&mut mir);
-                lumen::mir::print_mir(&mir)
-            })
+            .map(|hir| lumen::mir::print_mir(&optimized_mir(hir)))
             .unwrap_or_default(),
         Stage::Cfg => artifacts
             .hir
             .as_ref()
-            .map(|hir| {
-                let mut mir = lumen::mir::build(hir);
-                lumen::mir::optimize(&mut mir);
-                lumen::mir::to_dot(&mir)
-            })
+            .map(|hir| lumen::mir::to_dot(&optimized_mir(hir)))
             .unwrap_or_default(),
         Stage::C => artifacts
             .hir
@@ -387,23 +371,10 @@ fn render_dump(stage: Stage, artifacts: &lumen::Artifacts) -> String {
     }
 }
 
-/// Executes a compiled program, streaming its output and mapping VM errors to a
-/// non-zero exit code.
-fn execute_program(artifacts: &lumen::Artifacts) -> ExitCode {
-    let Some(program) = &artifacts.program else {
-        eprintln!("internal error: no program was produced");
-        return ExitCode::from(1);
-    };
-    match execute(program) {
-        Ok(execution) => {
-            print!("{}", execution.stdout);
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("runtime error: {err}");
-            ExitCode::from(1)
-        }
-    }
+fn optimized_mir(hir: &lumen::hir::Hir) -> lumen::mir::Program {
+    let mut mir = lumen::mir::build(hir);
+    lumen::mir::optimize(&mut mir);
+    mir
 }
 
 fn print_timings(session: &Session) {

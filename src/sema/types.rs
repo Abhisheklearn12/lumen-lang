@@ -1,14 +1,12 @@
-//! The semantic type representation, shared by type checking, HIR, and codegen.
+//! Semantic types, shared by type checking, HIR, and the backends.
 //!
-//! Lumen is monomorphic with a closed set of primitive types, so [`Type`] is a
-//! small `Copy` enum rather than an interned/structured type. The [`Type::Error`]
-//! variant is a *poison* value: it is produced wherever a type error has already
-//! been reported and then absorbs further checks involving it, which prevents a
-//! single mistake from cascading into a flood of follow-on diagnostics.
+//! [`Type`] is a small `Copy` enum: the primitives, plus arrays, structs, and
+//! tuples referred to by index. [`Type::Error`] marks an expression whose error
+//! has already been reported. It is compatible with every type, so one mistake
+//! does not cascade into more diagnostics.
 
-/// The element type of an array. A `Copy` sub-enum of the primitive types,
-/// which keeps [`Type`] itself `Copy` while still supporting `[i64]`, `[str]`,
-/// etc. Nested arrays are intentionally out of scope.
+/// An array element type. Only primitives qualify, which keeps [`Type`] `Copy`;
+/// arrays of arrays, structs, or tuples are not supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
     Int,
@@ -18,7 +16,7 @@ pub enum Elem {
 }
 
 impl Elem {
-    /// The full [`Type`] of this element.
+    /// The element as a [`Type`].
     pub fn ty(self) -> Type {
         match self {
             Elem::Int => Type::Int,
@@ -28,7 +26,7 @@ impl Elem {
         }
     }
 
-    /// The element kind for a primitive type, if it can be an array element.
+    /// The element type for `ty`, if `ty` can be an array element.
     pub fn of(ty: Type) -> Option<Elem> {
         Some(match ty {
             Type::Int => Elem::Int,
@@ -51,24 +49,23 @@ pub enum Type {
     Bool,
     /// Immutable UTF-8 string.
     Str,
-    /// The empty type, value of statements and `()`-returning functions.
+    /// The type of statements and of functions with no declared return type.
     Unit,
-    /// A growable array of a primitive element type.
+    /// An array of a primitive element type.
     Array(Elem),
-    /// A user-defined struct, identified by its dense struct index. The raw
-    /// `u32` (rather than a `resolve::StructId`) keeps this module free of any
-    /// dependency on name resolution.
+    /// A struct, by its [`StructId`](crate::sema::StructId) index. A raw `u32`
+    /// keeps this module independent of name resolution.
     Struct(u32),
-    /// A tuple, identified by its interned (structural) tuple-type index. The
-    /// element types live in a side table owned by the type checker.
+    /// A tuple, by its index in
+    /// [`Typeck::tuple_types`](crate::sema::Typeck::tuple_types). Tuples are
+    /// interned, so structurally equal tuple types share an index.
     Tuple(u32),
-    /// The error type  already-reported, absorbs further checks.
+    /// An error that has already been reported.
     Error,
 }
 
 impl Type {
-    /// Maps a primitive type *name* (as written in source) to its [`Type`].
-    /// Returns `None` for unknown names, which the caller reports.
+    /// The primitive type spelled `name` in source, if any.
     pub fn from_name(name: &str) -> Option<Type> {
         Some(match name {
             "i64" => Type::Int,
@@ -80,12 +77,12 @@ impl Type {
         })
     }
 
-    /// The array type with the given element type.
+    /// The array type with element type `elem`.
     pub fn array_of(elem: Elem) -> Type {
         Type::Array(elem)
     }
 
-    /// Whether this is the poison [`Type::Error`].
+    /// Whether this is [`Type::Error`].
     pub fn is_error(self) -> bool {
         matches!(self, Type::Error)
     }
@@ -95,7 +92,7 @@ impl Type {
         matches!(self, Type::Array(_))
     }
 
-    /// The element type if this is an array.
+    /// The element type, if this is an array.
     pub fn elem(self) -> Option<Elem> {
         match self {
             Type::Array(e) => Some(e),
@@ -103,15 +100,13 @@ impl Type {
         }
     }
 
-    /// Whether two types are compatible for assignment/unification.
-    ///
-    /// [`Type::Error`] is compatible with everything, so that an
-    /// already-reported error never triggers a second, spurious mismatch.
+    /// Whether the types agree: they are equal, or either is [`Type::Error`],
+    /// so a reported error never causes a second mismatch.
     pub fn compatible(self, other: Type) -> bool {
         self.is_error() || other.is_error() || self == other
     }
 
-    /// Whether arithmetic operators (`+ - * / %`) apply to this type.
+    /// Whether the arithmetic operators `+ - * / %` apply.
     pub fn is_numeric(self) -> bool {
         matches!(self, Type::Int | Type::Float)
     }
@@ -133,11 +128,8 @@ impl std::fmt::Display for Type {
     }
 }
 
-/// A compiler-provided function available to every program without declaration.
-///
-/// Builtins keep the language's surface tiny while still allowing real I/O in
-/// examples and tests. Each has a fixed monomorphic signature; the VM supplies
-/// the implementation.
+/// A function every program can call without declaring it. Each has a fixed
+/// signature, except `len`, which accepts any array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Builtin {
     /// `print_int(i64) -> unit`
@@ -156,8 +148,7 @@ pub enum Builtin {
     BoolToStr,
     /// `str_len(str) -> i64` - length in bytes.
     StrLen,
-    /// `len([T]) -> i64` - array length. Generic over the element type, so it
-    /// is checked specially rather than through [`Builtin::params`].
+    /// `len([T]) -> i64` - array length, for any element type.
     Len,
 
     // ---- integer math ----
@@ -217,13 +208,13 @@ pub enum Builtin {
     IndexOf,
     /// `parse_int(str) -> i64` - parse a decimal integer, or `0` on failure.
     ParseInt,
-    /// `char_to_str(i64) -> str` - the one-byte string for a byte value.
+    /// `char_to_str(i64) -> str` - the character for an ASCII code, else `""`.
     CharToStr,
     /// `to_upper(str) -> str` - ASCII upper-casing.
     ToUpper,
     /// `to_lower(str) -> str` - ASCII lower-casing.
     ToLower,
-    /// `trim(str) -> str` - strip leading and trailing ASCII whitespace.
+    /// `trim(str) -> str` - strip leading and trailing whitespace.
     Trim,
 
     // ---- more integer math ----
@@ -231,9 +222,8 @@ pub enum Builtin {
     Lcm,
 
     // ---- array construction ----
-    // Lumen has no generics, so allocating an array is one builtin per element
-    // type rather than a single polymorphic `array_new`. Each yields an array
-    // of `n` zero values, where `n` may be a runtime value.
+    // Without generics there is one allocator per element type. Each returns an
+    // array of `n` zero values, where `n` may be computed at runtime.
     /// `array_new_int(i64) -> [i64]`
     ArrayNewInt,
     /// `array_new_float(i64) -> [f64]`
@@ -245,7 +235,7 @@ pub enum Builtin {
 }
 
 impl Builtin {
-    /// Every builtin, used to seed the global name scope.
+    /// Every builtin, in declaration order.
     pub const ALL: [Builtin; 43] = [
         Builtin::PrintInt,
         Builtin::PrintFloat,
@@ -292,7 +282,7 @@ impl Builtin {
         Builtin::ArrayNewStr,
     ];
 
-    /// The name programs call this builtin by.
+    /// The name programs call it by.
     pub fn name(self) -> &'static str {
         match self {
             Builtin::PrintInt => "print_int",
@@ -341,20 +331,19 @@ impl Builtin {
         }
     }
 
-    /// The builtin invoked by `name`, if any.
+    /// The builtin called `name`, if any.
     pub fn from_name(name: &str) -> Option<Builtin> {
         Builtin::ALL.into_iter().find(|b| b.name() == name)
     }
 
-    /// Whether this builtin's signature is generic and therefore checked
-    /// specially (it cannot be described by a fixed [`Builtin::params`] list).
+    /// Whether the signature is generic (only `len`), so
+    /// [`Builtin::params`] cannot describe it.
     pub fn is_generic(self) -> bool {
         matches!(self, Builtin::Len)
     }
 
-    /// The element type this builtin allocates, if it is one of the
-    /// `array_new_*` family. This is the single mapping from builtin to element
-    /// type, so the code generator does not repeat it.
+    /// The element type an `array_new_*` builtin allocates; `None` for any
+    /// other builtin.
     pub fn new_array_elem(self) -> Option<Elem> {
         Some(match self {
             Builtin::ArrayNewInt => Elem::Int,
@@ -365,9 +354,8 @@ impl Builtin {
         })
     }
 
-    /// The parameter types this builtin accepts. Empty for [generic] builtins.
-    ///
-    /// [generic]: Builtin::is_generic
+    /// The parameter types; empty for a [generic](Builtin::is_generic)
+    /// builtin.
     pub fn params(self) -> &'static [Type] {
         match self {
             Builtin::PrintInt | Builtin::IntToStr => &[Type::Int],
@@ -405,7 +393,7 @@ impl Builtin {
         }
     }
 
-    /// The result type of this builtin.
+    /// The return type.
     pub fn ret(self) -> Type {
         match self {
             Builtin::PrintInt | Builtin::PrintFloat | Builtin::PrintBool | Builtin::PrintStr => {

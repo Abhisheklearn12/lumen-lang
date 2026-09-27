@@ -1,31 +1,26 @@
 //! # Lumen
 //!
-//! Lumen is a small, statically-typed programming language and the compiler
-//! that implements it. The compiler is organised as an explicit pipeline of
-//! phases, each with a narrow public API, its own diagnostics, and no hidden
-//! state shared with its neighbours:
+//! A small statically typed language and its compiler, built as a pipeline of
+//! phases that each read the previous phase's output and return a new one:
 //!
 //! ```text
 //! source ─▶ lexer ─▶ parser ─▶ AST
 //!                                │  name resolution
 //!                                ▼  type checking
 //!                               HIR (lowering)
-//!                                │  optimizer passes
+//!                                │  optimizer
 //!                                ▼
 //!                            bytecode ─▶ VM
 //! ```
 //!
-//! Phases communicate through distinct data types  [`lexer::Token`],
-//! [`parser::ast`], [`hir`], and [`backend::bytecode`]  so that no phase can
-//! reach into another's representation. Cross-cutting infrastructure
-//! ([`span`], [`source`], [`diagnostics`], [`errors`]) is shared by all.
+//! Each phase has its own representation ([`lexer::Token`], [`parser::ast`],
+//! [`hir`], [`backend::bytecode`]); [`span`], [`source`], [`diagnostics`], and
+//! [`errors`] are shared by all. Off the main path, [`mir`] and
+//! [`backend::c`] also start from HIR.
 //!
-//! The [`Session`] type ties the phases together and is the entry point most
-//! callers want; see its documentation for the end-to-end flow.
+//! [`Session`] runs the pipeline and is where most callers start.
 
-// The compiler holds itself to a high lint bar. These are denied rather than
-// warned so regressions fail the build, matching the project's acceptance
-// criteria.
+// Lints beyond the defaults. CI also fails on any warning.
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
 
@@ -49,9 +44,7 @@ pub use session::{Artifacts, PipelineOptions, Session, Stage};
 
 #[cfg(test)]
 mod foundation_tests {
-    //! Cross-module smoke tests for the shared foundation, exercising the way
-    //! spans, source files, and diagnostics compose  the contract every later
-    //! phase relies on.
+    //! Spans, source files, and diagnostics working together.
 
     use crate::diagnostics::{Diagnostic, Diagnostics};
     use crate::errors::DiagCode;

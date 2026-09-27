@@ -57,7 +57,7 @@ fn names_lower_to_local_reads() {
 fn calls_resolve_to_callees() {
     let hir = lower_src("fn g(x: i64) -> i64 { x } fn main() { let y = g(1); print_int(y); }");
     let main = hir.functions.iter().find(|f| f.name == "main").unwrap();
-    // First statement: `let y = g(1)`  call to a user function.
+    // `let y = g(1)` calls a user function.
     let Stmt::Let { value, .. } = &main.body.stmts[0] else {
         panic!("expected let")
     };
@@ -68,7 +68,7 @@ fn calls_resolve_to_callees() {
             ..
         }
     ));
-    // Second statement: `print_int(y)`  a builtin call.
+    // `print_int(y)` calls a builtin.
     let Stmt::Expr(call) = &main.body.stmts[1] else {
         panic!("expected expr-stmt")
     };

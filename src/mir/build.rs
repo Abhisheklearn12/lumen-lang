@@ -1,25 +1,20 @@
-//! Lowering from [`Hir`](crate::hir) to [`Program`](super::Program) MIR.
+//! Building MIR from [HIR](crate::hir).
 //!
-//! Expressions are flattened into a sequence of three-address instructions
-//! writing to fresh [`Reg`]s, and every control-flow construct is turned into
-//! explicit basic blocks and branches:
+//! Each expression becomes instructions writing fresh [`Reg`]s, and control
+//! flow becomes blocks:
 //!
-//! * `if` evaluates each arm into a synthesised result local, then both arms
-//!   jump to a common merge block that loads it.
-//! * `while`/`for` become header/body/after blocks; `break`/`continue` jump to
-//!   the after/continuation block of the innermost loop (tracked on a stack).
-//! * `&&`/`||` short-circuit through a temporary local, mirroring their runtime
-//!   semantics.
-//!
-//! The result is a CFG where the only values that cross block boundaries do so
-//! through locals, which keeps the builder simple while still giving the
-//! optimizer an explicit graph to work on.
+//! * `if` stores each arm's value in a temporary local, and both arms jump to a
+//!   merge block that loads it.
+//! * `while` and `for` get header, body, and exit blocks, and `for` an
+//!   increment block too; `break` and `continue` jump to the innermost loop's
+//!   exit or continue target.
+//! * `&&` and `||` short-circuit through a temporary local.
 
 use crate::hir::{self, ExprKind, Hir, Stmt};
 use crate::mir::*;
 use crate::sema::types::Type;
 
-/// Lowers a whole HIR program to MIR.
+/// Builds MIR for a whole program.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn build(hir: &Hir) -> Program {
     let functions = hir.functions.iter().map(build_function).collect();
@@ -51,7 +46,7 @@ fn build_function(func: &hir::Function) -> Function {
     }
 }
 
-/// The continuation targets of an enclosing loop.
+/// Where `continue` and `break` go in an enclosing loop.
 struct Loop {
     continue_bb: BlockId,
     break_bb: BlockId,
@@ -61,10 +56,14 @@ struct Builder {
     locals: Vec<LocalDecl>,
     reg_count: usize,
     blocks: Vec<Block>,
-    /// The block instructions are currently appended to.
+    /// The block being filled.
     cur: BlockId,
+    /// Enclosing loops, innermost last.
     loops: Vec<Loop>,
 }
+
+/// The `unit` constant operand.
+const UNIT: Operand = Operand::Const(Const::Unit);
 
 impl Builder {
     fn new_block(&mut self) -> BlockId {
@@ -82,7 +81,7 @@ impl Builder {
         r
     }
 
-    /// Allocates a fresh, compiler-internal local of the given type.
+    /// Allocates a compiler temporary local.
     fn fresh_local(&mut self, ty: Type) -> LocalId {
         let id = LocalId(self.locals.len() as u32);
         self.locals.push(LocalDecl {
@@ -96,8 +95,11 @@ impl Builder {
         self.blocks[self.cur.0 as usize].insts.push(inst);
     }
 
-    /// Sets the current block's terminator (only if still unset) and is a no-op
-    /// on an already-terminated block.
+    fn store(&mut self, local: LocalId, src: Operand) {
+        self.emit(Inst::Store { local, src });
+    }
+
+    /// Terminates the current block, unless it already is.
     fn terminate(&mut self, term: Terminator) {
         let block = &mut self.blocks[self.cur.0 as usize];
         if matches!(block.term, Terminator::Unreachable) {
@@ -105,7 +107,7 @@ impl Builder {
         }
     }
 
-    /// Materialises an rvalue into a fresh register and returns it as an operand.
+    /// Computes `rvalue` into a fresh register, returned as an operand.
     fn push_value(&mut self, rvalue: Rvalue) -> Operand {
         let dst = self.fresh_reg();
         self.emit(Inst::Assign { dst, rvalue });
@@ -120,7 +122,7 @@ impl Builder {
         }
         match &block.tail {
             Some(tail) => self.lower_expr(tail),
-            None => Operand::Const(Const::Unit),
+            None => UNIT,
         }
     }
 
@@ -128,7 +130,7 @@ impl Builder {
         match stmt {
             Stmt::Let { local, value } => {
                 let src = self.lower_expr(value);
-                self.emit(Inst::Store { local: *local, src });
+                self.store(*local, src);
             }
             Stmt::Expr(e) => {
                 self.lower_expr(e);
@@ -136,10 +138,10 @@ impl Builder {
             Stmt::Return(value) => {
                 let op = match value {
                     Some(e) => self.lower_expr(e),
-                    None => Operand::Const(Const::Unit),
+                    None => UNIT,
                 };
                 self.terminate(Terminator::Return(op));
-                // Subsequent statements are unreachable; continue in a dead block.
+                // Anything after is unreachable; it goes in a fresh block.
                 self.cur = self.new_block();
             }
             Stmt::While { cond, body } => self.lower_while(cond, body),
@@ -190,15 +192,9 @@ impl Builder {
         body: &hir::Block,
     ) {
         let start_op = self.lower_expr(start);
-        self.emit(Inst::Store {
-            local: var,
-            src: start_op,
-        });
+        self.store(var, start_op);
         let end_op = self.lower_expr(end);
-        self.emit(Inst::Store {
-            local: end_var,
-            src: end_op,
-        });
+        self.store(end_var, end_op);
 
         let header = self.new_block();
         let body_bb = self.new_block();
@@ -235,10 +231,7 @@ impl Builder {
             v,
             Operand::Const(Const::Int(1)),
         ));
-        self.emit(Inst::Store {
-            local: var,
-            src: next,
-        });
+        self.store(var, next);
         self.terminate(Terminator::Goto(header));
 
         self.cur = after;
@@ -253,7 +246,7 @@ impl Builder {
             };
             self.terminate(Terminator::Goto(target));
         }
-        // Continue lowering into a fresh (dead) block.
+        // Anything after is unreachable; it goes in a fresh block.
         self.cur = self.new_block();
     }
 
@@ -284,8 +277,8 @@ impl Builder {
             }
             ExprKind::Assign { local, value } => {
                 let src = self.lower_expr(value);
-                self.emit(Inst::Store { local: *local, src });
-                Operand::Const(Const::Unit)
+                self.store(*local, src);
+                UNIT
             }
             ExprKind::ArrayLit(elems) => {
                 let ops = elems.iter().map(|e| self.lower_expr(e)).collect();
@@ -305,9 +298,9 @@ impl Builder {
                     index: i,
                     value: v,
                 });
-                Operand::Const(Const::Unit)
+                UNIT
             }
-            // Structs share the array representation (fixed-length records).
+            // A struct is an array of its fields.
             ExprKind::StructLit(fields) => {
                 let ops = fields.iter().map(|e| self.lower_expr(e)).collect();
                 self.push_value(Rvalue::MakeArray(ops))
@@ -324,7 +317,7 @@ impl Builder {
                     index: Operand::Const(Const::Int(*idx as i64)),
                     value: v,
                 });
-                Operand::Const(Const::Unit)
+                UNIT
             }
             ExprKind::If {
                 cond,
@@ -351,8 +344,8 @@ impl Builder {
         }
     }
 
-    /// Lowers `a && b` (`or_else = false`) or `a || b` (`or_else = true`) with
-    /// short-circuit evaluation through a result local.
+    /// Lowers `a && b` (`or_else` false) or `a || b` (`or_else` true); `b` is
+    /// evaluated only if needed.
     fn lower_logical(&mut self, lhs: &hir::Expr, rhs: &hir::Expr, or_else: bool) -> Operand {
         let result = self.fresh_local(Type::Bool);
         let l = self.lower_expr(lhs);
@@ -360,7 +353,7 @@ impl Builder {
         let eval_rhs = self.new_block();
         let short = self.new_block();
         let merge = self.new_block();
-        // For `&&`: if lhs is false, short-circuit; for `||`: if lhs is true.
+        // `&&` skips `b` when `a` is false; `||` when it is true.
         let (then_bb, else_bb) = if or_else {
             (short, eval_rhs)
         } else {
@@ -374,17 +367,11 @@ impl Builder {
 
         self.cur = eval_rhs;
         let r = self.lower_expr(rhs);
-        self.emit(Inst::Store {
-            local: result,
-            src: r,
-        });
+        self.store(result, r);
         self.terminate(Terminator::Goto(merge));
 
         self.cur = short;
-        self.emit(Inst::Store {
-            local: result,
-            src: Operand::Const(Const::Bool(or_else)),
-        });
+        self.store(result, Operand::Const(Const::Bool(or_else)));
         self.terminate(Terminator::Goto(merge));
 
         self.cur = merge;
@@ -411,21 +398,15 @@ impl Builder {
 
         self.cur = then_bb;
         let then_val = self.lower_block(then_branch);
-        self.emit(Inst::Store {
-            local: result,
-            src: then_val,
-        });
+        self.store(result, then_val);
         self.terminate(Terminator::Goto(merge));
 
         self.cur = else_bb;
         let else_val = match else_branch {
             Some(e) => self.lower_expr(e),
-            None => Operand::Const(Const::Unit),
+            None => UNIT,
         };
-        self.emit(Inst::Store {
-            local: result,
-            src: else_val,
-        });
+        self.store(result, else_val);
         self.terminate(Terminator::Goto(merge));
 
         self.cur = merge;

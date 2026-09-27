@@ -1,33 +1,24 @@
-//! Optimization passes over MIR.
+//! MIR optimization passes, repeated until nothing changes (at most 8 rounds):
 //!
-//! These are the classic data-flow optimizations that the CFG form makes
-//! natural, run to a fixpoint:
+//! * [`const_fold`]: operators on constants, and branches on a constant.
+//! * [`algebraic_simplify`]: integer identities such as `x + 0` and `x - x`.
+//! * [`copy_propagation`]: uses of `r = x` become uses of `x`, which with
+//!   folding also propagates constants.
+//! * [`local_cse`]: reuses an identical earlier computation in the same block.
+//! * [`dead_store`]: drops a store overwritten later in its block, unread.
+//! * [`dead_code`]: drops computations whose register is never read.
+//! * [`simplify_cfg`]: collapses branches whose targets match, threads empty
+//!   blocks, and removes unreachable ones.
 //!
-//! * [`const_fold`] - fold operators on constant operands, and rewrite a branch
-//!   with a constant condition into an unconditional `goto`.
-//! * [`algebraic_simplify`] - apply identity and absorbing-element laws
-//!   (`x + 0`, `x * 1`, `x * 0`, `x - x`, …) that hold even when one side is not
-//!   constant.
-//! * [`copy_propagation`] - when a register is just a copy of another operand
-//!   (`r = x`), replace every use of `r` with `x`. Combined with folding this
-//!   also achieves constant propagation.
-//! * [`local_cse`] - within a block, reuse the result of an identical earlier
-//!   pure computation instead of recomputing it.
-//! * [`dead_store`] - drop a store to a local that a later store in the same
-//!   block overwrites before any read.
-//! * [`dead_code`] - delete pure instructions whose result is never used.
-//! * [`simplify_cfg`] - drop blocks unreachable from the entry, collapse a
-//!   branch whose arms coincide, and thread empty `goto`-only blocks.
-//!
-//! Every pass preserves observable behaviour: instructions with side effects
-//! (`Call`, `Store`, `SetIndex`) are never removed, only pure computations.
+//! An instruction with side effects (`Call`, `Store`, `SetIndex`) is removed
+//! only in an unreachable block, or as a dead store.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::hir::{BinOp, UnOp};
 use crate::mir::*;
 
-/// Statistics from an optimization run.
+/// Rewrites made by each pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MirStats {
     pub folded: usize,
@@ -40,6 +31,7 @@ pub struct MirStats {
 }
 
 impl MirStats {
+    /// Total rewrites across all passes.
     pub fn total(&self) -> usize {
         self.folded
             + self.simplified
@@ -51,28 +43,36 @@ impl MirStats {
     }
 }
 
-/// Optimizes every function in `program` to a fixpoint.
+impl std::ops::AddAssign for MirStats {
+    fn add_assign(&mut self, other: MirStats) {
+        self.folded += other.folded;
+        self.simplified += other.simplified;
+        self.propagated += other.propagated;
+        self.cse += other.cse;
+        self.dead_stores += other.dead_stores;
+        self.removed += other.removed;
+        self.blocks_removed += other.blocks_removed;
+    }
+}
+
+/// Optimizes every function in `program`.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn optimize(program: &mut Program) -> MirStats {
     let mut stats = MirStats::default();
     for func in &mut program.functions {
         for _ in 0..8 {
-            let folded = const_fold(func);
-            let simplified = algebraic_simplify(func);
-            let propagated = copy_propagation(func);
-            let cse = local_cse(func);
-            let dead_stores = dead_store(func);
-            let removed = dead_code(func);
-            let blocks_removed = simplify_cfg(func);
-            stats.folded += folded;
-            stats.simplified += simplified;
-            stats.propagated += propagated;
-            stats.cse += cse;
-            stats.dead_stores += dead_stores;
-            stats.removed += removed;
-            stats.blocks_removed += blocks_removed;
-            if folded + simplified + propagated + cse + dead_stores + removed + blocks_removed == 0
-            {
+            // Fields are evaluated in the order written, which is the pass order.
+            let round = MirStats {
+                folded: const_fold(func),
+                simplified: algebraic_simplify(func),
+                propagated: copy_propagation(func),
+                cse: local_cse(func),
+                dead_stores: dead_store(func),
+                removed: dead_code(func),
+                blocks_removed: simplify_cfg(func),
+            };
+            stats += round;
+            if round.total() == 0 {
                 break;
             }
         }
@@ -81,11 +81,10 @@ pub fn optimize(program: &mut Program) -> MirStats {
     stats
 }
 
-// ---------------------------------------------------------------------------
-// Constant folding
-// ---------------------------------------------------------------------------
+// ---- constant folding ----
 
-/// Folds constant computations and constant branches. Returns the change count.
+/// Folds operators on constants, and branches on a constant into a `goto`.
+/// Returns the number of rewrites.
 pub fn const_fold(func: &mut Function) -> usize {
     let mut count = 0;
     for block in &mut func.blocks {
@@ -97,7 +96,6 @@ pub fn const_fold(func: &mut Function) -> usize {
                 count += 1;
             }
         }
-        // A branch on a constant becomes an unconditional jump.
         if let Terminator::Branch {
             cond: Operand::Const(Const::Bool(b)),
             then_bb,
@@ -172,16 +170,15 @@ fn fold_binary(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Algebraic simplification
-// ---------------------------------------------------------------------------
+// ---- algebraic simplification ----
 
-/// Applies integer identity and absorbing-element laws to `Binary` rvalues,
-/// turning them into a copy of an operand or a constant. These hold regardless
-/// of whether the other side is a constant, so they catch cases folding cannot.
+/// Rewrites `Binary` rvalues with an identity or absorbing operand (`x + 0`,
+/// `x * 1`, `x * 0`, `x - x`, ...) into a copy or a constant, even when the
+/// other side is not constant.
 ///
-/// Only integer rules are applied: float `x + 0.0` would mishandle `-0.0`/`NaN`,
-/// and `&&`/`||` are lowered to control flow, never to a `Binary` here.
+/// The rules are for integers only: float `x + 0.0` is wrong for `-0.0`, and
+/// `x * 0.0` for NaN or negative `x`. (`&&` and `||` are control flow in MIR,
+/// never `Binary`.)
 pub fn algebraic_simplify(func: &mut Function) -> usize {
     let mut count = 0;
     for block in &mut func.blocks {
@@ -206,7 +203,7 @@ fn same_reg(a: &Operand, b: &Operand) -> bool {
     matches!((a, b), (Operand::Reg(x), Operand::Reg(y)) if x == y)
 }
 
-/// The simplified rvalue for `a op b`, if an integer law applies.
+/// The simpler rvalue for `a op b`, if an integer identity applies.
 fn simplify_binary(op: BinOp, a: &Operand, b: &Operand) -> Option<Rvalue> {
     let use_op = |o: &Operand| Rvalue::Use(o.clone());
     let zero = || Rvalue::Use(Operand::Const(Const::Int(0)));
@@ -228,14 +225,11 @@ fn simplify_binary(op: BinOp, a: &Operand, b: &Operand) -> Option<Rvalue> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Copy / constant propagation
-// ---------------------------------------------------------------------------
+// ---- copy / constant propagation ----
 
-/// Replaces uses of registers that are simple copies (`r = x`) with `x`.
+/// Replaces each use of a register defined as a copy (`r = x`) with `x`.
 pub fn copy_propagation(func: &mut Function) -> usize {
-    // Map each register that is defined exactly by `Use(operand)` to that
-    // operand, resolving chains so `a = b; b = 1` propagates `1` for `a`.
+    // Register → the operand it copies, following chains of copies.
     let mut copies: HashMap<Reg, Operand> = HashMap::new();
     for block in &func.blocks {
         for inst in &block.insts {
@@ -265,7 +259,7 @@ pub fn copy_propagation(func: &mut Function) -> usize {
     count
 }
 
-/// Follows a copy chain to the ultimate operand.
+/// Follows a chain of copies to its source (at most 1000 steps).
 fn resolve(op: &Operand, copies: &HashMap<Reg, Operand>) -> Operand {
     let mut cur = op.clone();
     let mut guard = 0;
@@ -281,11 +275,9 @@ fn resolve(op: &Operand, copies: &HashMap<Reg, Operand>) -> Operand {
     cur
 }
 
-// ---------------------------------------------------------------------------
-// Dead-code elimination
-// ---------------------------------------------------------------------------
+// ---- dead-code elimination ----
 
-/// Removes pure `Assign` instructions whose destination register is never read.
+/// Removes `Assign` instructions whose register is never read.
 pub fn dead_code(func: &mut Function) -> usize {
     let used = used_regs(func);
     let mut count = 0;
@@ -293,7 +285,7 @@ pub fn dead_code(func: &mut Function) -> usize {
         let before = block.insts.len();
         block.insts.retain(|inst| match inst {
             Inst::Assign { dst, rvalue } => used.contains(dst) || !rvalue_is_pure(rvalue),
-            // Stores, set-index, and calls have effects and are always kept.
+            // Stores and calls have effects.
             _ => true,
         });
         count += before - block.insts.len();
@@ -301,7 +293,7 @@ pub fn dead_code(func: &mut Function) -> usize {
     count
 }
 
-/// The set of registers read anywhere in the function.
+/// The registers read anywhere in `func`.
 fn used_regs(func: &Function) -> HashSet<Reg> {
     let mut used = HashSet::new();
     let mut record = |op: &Operand| {
@@ -331,40 +323,33 @@ fn used_regs(func: &Function) -> HashSet<Reg> {
     used
 }
 
-/// Whether an rvalue has no side effects (all current rvalues are pure; only
-/// `Call`/`Store`/`SetIndex` instructions effect the world).
+/// Whether an rvalue has no side effects. Every rvalue is pure today; only
+/// the `Call`, `Store`, and `SetIndex` instructions have effects.
 fn rvalue_is_pure(_rvalue: &Rvalue) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
-// Dead-store elimination
-// ---------------------------------------------------------------------------
+// ---- dead-store elimination ----
 
-/// Removes a `Store` to a local that a later store in the *same block*
-/// overwrites before any intervening read of that local.
-///
-/// Working within a single block keeps this sound without a cross-block
-/// liveness analysis: a store that is overwritten before the block ends cannot
-/// have been observed by any successor, because the local's value never escaped
-/// the block. Only `Load` reads a local, so it is the sole thing that keeps an
-/// earlier store alive.
+/// Removes a `Store` that a later store to the same local, in the same block,
+/// overwrites with no `Load` of it in between. Staying within one block makes
+/// this sound without liveness analysis: no successor can see the dead value.
 pub fn dead_store(func: &mut Function) -> usize {
     let mut count = 0;
     for block in &mut func.blocks {
-        // local -> index of its latest store that has not yet been read.
+        // Local → index of its latest store not yet read.
         let mut pending: HashMap<LocalId, usize> = HashMap::new();
         let mut dead: HashSet<usize> = HashSet::new();
         for (i, inst) in block.insts.iter().enumerate() {
             match inst {
-                // A read keeps the local's pending store alive.
+                // A read keeps the pending store.
                 Inst::Assign {
                     rvalue: Rvalue::Load(local),
                     ..
                 } => {
                     pending.remove(local);
                 }
-                // A new store kills the previous unread store to the same local.
+                // A second store kills the first.
                 Inst::Store { local, .. } => {
                     if let Some(prev) = pending.insert(*local, i) {
                         dead.insert(prev);
@@ -388,14 +373,13 @@ pub fn dead_store(func: &mut Function) -> usize {
     count
 }
 
-// ---------------------------------------------------------------------------
-// CFG simplification
-// ---------------------------------------------------------------------------
+// ---- CFG simplification ----
 
-/// Collapses degenerate branches, threads empty blocks, and removes blocks
-/// unreachable from the entry. Returns the number of blocks removed.
+/// Collapses branches whose targets match, threads jumps through empty
+/// blocks, and removes blocks unreachable from the entry. Returns the number of
+/// blocks removed.
 pub fn simplify_cfg(func: &mut Function) -> usize {
-    // 1. Collapse a branch whose arms are identical into a goto.
+    // 1. A branch to the same block either way is a goto.
     for block in &mut func.blocks {
         if let Terminator::Branch {
             then_bb, else_bb, ..
@@ -406,8 +390,7 @@ pub fn simplify_cfg(func: &mut Function) -> usize {
         }
     }
 
-    // 2. Thread jumps through empty `goto`-only blocks (those with no
-    //    instructions and a `Goto` terminator).
+    // 2. Jump past blocks that are just a `goto`, one hop per round.
     let forward: HashMap<BlockId, BlockId> = func
         .blocks
         .iter()
@@ -419,11 +402,11 @@ pub fn simplify_cfg(func: &mut Function) -> usize {
         .collect();
     if !forward.is_empty() {
         for block in &mut func.blocks {
-            redirect(&mut block.term, &forward);
+            retarget(&mut block.term, &forward);
         }
     }
 
-    // 3. Remove blocks unreachable from the entry.
+    // 3. Remove unreachable blocks.
     let reachable = reachable_blocks(func);
     if reachable.len() == func.blocks.len() {
         return 0;
@@ -431,17 +414,16 @@ pub fn simplify_cfg(func: &mut Function) -> usize {
     remove_unreachable(func, &reachable)
 }
 
-/// Rewrites a terminator's targets through the forwarding table (one hop, since
-/// the pass runs to a fixpoint).
-fn redirect(term: &mut Terminator, forward: &HashMap<BlockId, BlockId>) {
-    let hop = |b: BlockId| forward.get(&b).copied().unwrap_or(b);
+/// Replaces each target of `term` found in `map` with its image.
+fn retarget(term: &mut Terminator, map: &HashMap<BlockId, BlockId>) {
+    let to = |b: BlockId| map.get(&b).copied().unwrap_or(b);
     match term {
-        Terminator::Goto(t) => *t = hop(*t),
+        Terminator::Goto(t) => *t = to(*t),
         Terminator::Branch {
             then_bb, else_bb, ..
         } => {
-            *then_bb = hop(*then_bb);
-            *else_bb = hop(*else_bb);
+            *then_bb = to(*then_bb);
+            *else_bb = to(*else_bb);
         }
         Terminator::Return(_) | Terminator::Unreachable => {}
     }
@@ -458,11 +440,11 @@ fn reachable_blocks(func: &Function) -> HashSet<BlockId> {
     seen
 }
 
-/// Drops unreachable blocks and renumbers the survivors, fixing up all targets.
+/// Drops unreachable blocks and renumbers the rest densely.
 fn remove_unreachable(func: &mut Function, reachable: &HashSet<BlockId>) -> usize {
     let removed = func.blocks.len() - reachable.len();
 
-    // Old BlockId -> new dense index.
+    // Old id → new id.
     let mut remap: HashMap<BlockId, BlockId> = HashMap::new();
     let mut next = 0u32;
     for i in 0..func.blocks.len() as u32 {
@@ -477,32 +459,16 @@ fn remove_unreachable(func: &mut Function, reachable: &HashSet<BlockId>) -> usiz
         if !reachable.contains(&BlockId(i as u32)) {
             continue;
         }
-        renumber(&mut block.term, &remap);
+        retarget(&mut block.term, &remap);
         func.blocks.push(block);
     }
     func.entry = remap[&func.entry];
     removed
 }
 
-fn renumber(term: &mut Terminator, remap: &HashMap<BlockId, BlockId>) {
-    let to = |b: BlockId| remap.get(&b).copied().unwrap_or(b);
-    match term {
-        Terminator::Goto(t) => *t = to(*t),
-        Terminator::Branch {
-            then_bb, else_bb, ..
-        } => {
-            *then_bb = to(*then_bb);
-            *else_bb = to(*else_bb);
-        }
-        Terminator::Return(_) | Terminator::Unreachable => {}
-    }
-}
+// ---- operand traversal helpers ----
 
-// ---------------------------------------------------------------------------
-// Operand traversal helpers
-// ---------------------------------------------------------------------------
-
-/// Applies `f` to every operand *read* in the function (not definitions).
+/// Applies `f` to every operand `func` reads.
 fn map_operands(func: &mut Function, f: &mut impl FnMut(&mut Operand)) {
     for block in &mut func.blocks {
         for inst in &mut block.insts {
@@ -537,28 +503,19 @@ fn rvalue_operands(rvalue: &Rvalue, f: &mut impl FnMut(&Operand)) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Local common-subexpression elimination
-// ---------------------------------------------------------------------------
+// ---- local common-subexpression elimination ----
 
-/// Within each basic block, replaces a repeated pure computation with a copy of
-/// the register that first produced it. Because MIR registers are
-/// single-assignment, a value computed from the same operands earlier in the
-/// block is guaranteed still valid, so `b = x + y` following `a = x + y`
-/// becomes `b = a` (which copy propagation then forwards).
+/// Within each block, turns a repeat of an earlier computation into a copy of
+/// its register: `a = x + y; b = x + y` becomes `b = a`. Registers are written
+/// once, so the earlier result is still valid.
 ///
-/// Eligible rvalues are the side-effect-free ones: `Unary`, `Binary`, `Concat`,
-/// and `Load`. A repeated `Load(l)` is forwarded too (redundant-load
-/// elimination), which is what lets arithmetic over the *same* variable
-/// deduplicate after copy propagation reunites the operand registers. To keep
-/// load forwarding sound, every cached `Load(l)` is dropped when a `Store(l)`
-/// could have changed `l`. `Index` and `MakeArray` are never reused: an array's
-/// contents are mutable and each `MakeArray` yields a distinct value.
+/// `Unary`, `Binary`, `Concat`, and `Load` are reused; a `Store` to a local
+/// forgets its cached `Load`s. `Index` and `MakeArray` are not: array contents
+/// can change, and each `MakeArray` creates a distinct array.
 pub fn local_cse(func: &mut Function) -> usize {
     let mut count = 0;
     for block in &mut func.blocks {
-        // First occurrences of each eligible rvalue, with the register holding
-        // the result. Reset per block (block-local analysis only).
+        // Each computation seen so far in this block, and its register.
         let mut seen: Vec<(Rvalue, Reg)> = Vec::new();
         for inst in &mut block.insts {
             match inst {
@@ -574,7 +531,6 @@ pub fn local_cse(func: &mut Function) -> usize {
                         None => seen.push((rvalue.clone(), *dst)),
                     }
                 }
-                // A store to `local` invalidates any cached load of it.
                 Inst::Store { local, .. } => {
                     seen.retain(|(rv, _)| !matches!(rv, Rvalue::Load(l) if l == local));
                 }
@@ -585,7 +541,7 @@ pub fn local_cse(func: &mut Function) -> usize {
     count
 }
 
-/// Whether an rvalue is a pure value computation safe to deduplicate.
+/// Whether `local_cse` may reuse this rvalue.
 fn cse_eligible(rvalue: &Rvalue) -> bool {
     matches!(
         rvalue,
@@ -593,8 +549,8 @@ fn cse_eligible(rvalue: &Rvalue) -> bool {
     )
 }
 
-/// Structural equality for the CSE-eligible rvalues. Operands compare by value,
-/// so identical constants and identical (single-assignment) registers match.
+/// Whether two reusable rvalues compute the same value: the same operator on
+/// equal operands.
 fn cse_eq(a: &Rvalue, b: &Rvalue) -> bool {
     match (a, b) {
         (Rvalue::Unary(o1, x1), Rvalue::Unary(o2, x2)) => o1 == o2 && x1 == x2,

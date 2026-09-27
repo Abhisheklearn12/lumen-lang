@@ -1,9 +1,5 @@
-//! Shared evaluation of the builtin functions.
-//!
-//! Both execution engines (the stack [`vm`](crate::backend::vm) and the
-//! [`mir::interp`](crate::mir::interp) interpreter) call into here, so a builtin
-//! behaves identically no matter which engine runs the program. Output from the
-//! `print_*` family is appended to the caller's buffer.
+//! The builtin functions, shared by the [VM](crate::backend::vm) and the
+//! [MIR interpreter](crate::mir::interp) so both behave the same.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,9 +8,11 @@ use crate::backend::bytecode::Value;
 use crate::backend::vm::{MAX_ARRAY_LEN, VmError, index_in_bounds};
 use crate::sema::types::{Builtin, Elem};
 
-/// Evaluates a builtin over already-evaluated arguments, appending any printed
-/// output to `out`. The type checker guarantees argument arity and types, so a
-/// shape mismatch here is an internal error rather than a user error.
+/// Calls `builtin` on `args`, appending printed output to `out`.
+///
+/// `len` is not handled: both engines implement it themselves. Type checking
+/// guarantees the argument count and types, so a mismatch is
+/// [`VmError::Internal`].
 pub fn eval(builtin: Builtin, args: &[Value], out: &mut String) -> Result<Value, VmError> {
     let bad = || VmError::Internal("builtin called with wrong argument");
     let print = |out: &mut String, text: String| {
@@ -99,7 +97,7 @@ pub fn eval(builtin: Builtin, args: &[Value], out: &mut String) -> Result<Value,
         (Builtin::ToLower, [Value::Str(s)]) => Value::Str(s.to_ascii_lowercase().into()),
         (Builtin::Trim, [Value::Str(s)]) => Value::Str(s.trim().into()),
         (Builtin::CharToStr, [Value::Int(v)]) => {
-            // A byte value in range yields its one-byte string; otherwise empty.
+            // An ASCII code gives its character; anything else gives "".
             let byte = u8::try_from(*v).ok();
             let s = byte
                 .filter(|b| b.is_ascii())
@@ -116,16 +114,10 @@ pub fn eval(builtin: Builtin, args: &[Value], out: &mut String) -> Result<Value,
     })
 }
 
-/// Allocates an array of `len` zero values of element type `elem`.
-///
-/// This is the one definition of what `array_new_*` means. The stack VM
-/// reaches it through [`Op::NewArray`](crate::backend::bytecode::Op::NewArray)
-/// and the MIR interpreter through [`eval`] above, so the two engines cannot
-/// drift apart.
-///
-/// A negative length is a program error. An excessive one is refused rather
-/// than handed to the allocator, so it fails as a [`VmError`] instead of
-/// aborting the process.
+/// An array of `len` zero values of type `elem`: what every `array_new_*`
+/// does, reached from [`Op::NewArray`](crate::backend::bytecode::Op::NewArray)
+/// in the VM and from [`eval`] in the MIR interpreter. A negative length, or
+/// one over [`MAX_ARRAY_LEN`], is a [`VmError`].
 pub fn new_array(elem: Elem, len: i64) -> Result<Value, VmError> {
     if len < 0 {
         return Err(VmError::NegativeArrayLength(len));
@@ -140,7 +132,7 @@ pub fn new_array(elem: Elem, len: i64) -> Result<Value, VmError> {
     Ok(Value::Array(Rc::new(RefCell::new(items))))
 }
 
-/// The zero value an `array_new_*` fills its array with.
+/// The value a new array is filled with.
 fn zero_value(elem: Elem) -> Value {
     match elem {
         Elem::Int => Value::Int(0),
@@ -150,8 +142,7 @@ fn zero_value(elem: Elem) -> Value {
     }
 }
 
-/// Greatest common divisor of two integers' magnitudes (Euclid's algorithm).
-/// `gcd(0, 0)` is `0`.
+/// The greatest common divisor of `|a|` and `|b|`; `gcd(0, 0)` is `0`.
 fn gcd(a: i64, b: i64) -> i64 {
     let mut a = a.unsigned_abs();
     let mut b = b.unsigned_abs();
@@ -163,9 +154,8 @@ fn gcd(a: i64, b: i64) -> i64 {
     a as i64
 }
 
-/// Returns the byte substring `[start, end)` of `s`, clamped to bounds. If the
-/// range does not fall on character boundaries, yields the empty string rather
-/// than panicking.
+/// Bytes `[start, end)` of `s`, clamped to its length; `""` if the range is
+/// empty or splits a character.
 fn substring(s: &str, start: i64, end: i64) -> String {
     let len = s.len() as i64;
     let start = start.clamp(0, len) as usize;

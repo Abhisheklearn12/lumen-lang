@@ -1,16 +1,13 @@
-//! Long-form explanations of diagnostic codes, in the spirit of
-//! `rustc --explain`.
+//! Long-form explanations of diagnostic codes, shown by `lumenc explain`.
 //!
-//! Each [`DiagCode`] has a paragraph describing *why* the error happens and a
-//! short example contrasting the broken and fixed forms. The driver exposes
-//! these through `lumenc explain E0300`. Keeping the prose next to the codes
-//! (rather than in scattered docs) means an explanation is impossible to forget
-//! when a new code is added - the [test](#tests) asserts every code is covered.
+//! Each explanation says why the error happens and gives a minimal example.
+//! The match in [`explain_code`] is exhaustive, so a new [`DiagCode`] cannot
+//! ship without one.
 
 use crate::errors::DiagCode;
 
-/// Returns the long-form explanation for a diagnostic code string such as
-/// `"E0300"`, or `None` if the code is unknown.
+/// The explanation for a code string such as `"E0300"`, or `None` if the code
+/// is unknown.
 pub fn explain(code: &str) -> Option<&'static str> {
     DiagCode::ALL
         .iter()
@@ -19,7 +16,7 @@ pub fn explain(code: &str) -> Option<&'static str> {
         .map(explain_code)
 }
 
-/// The explanation for a known [`DiagCode`].
+/// The explanation for `code`.
 pub fn explain_code(code: DiagCode) -> &'static str {
     use DiagCode::*;
     match code {

@@ -1,17 +1,11 @@
-//! "Did you mean …?" suggestions for diagnostics.
+//! "Did you mean …?" suggestions.
 //!
-//! When a name fails to resolve or a type is unknown, the relevant phase calls
-//! [`closest`] with the list of names that *would* have been valid. If one is a
-//! near-miss for what the user wrote - by Levenshtein edit distance within a
-//! small, length-scaled threshold - it is offered as a help suggestion.
-//!
-//! The threshold is deliberately conservative: a short identifier tolerates at
-//! most one edit, longer ones a few, so suggestions are only made when they are
-//! plausibly a typo rather than an unrelated name.
+//! [`closest`] offers the candidate with the smallest Levenshtein distance to a
+//! misspelled name, but only within a threshold that grows with its length, so
+//! unrelated names are never suggested.
 
-/// Returns the candidate closest to `target`, if one is within the suggestion
-/// threshold. Ties break toward the first candidate in iteration order, which is
-/// stable for the callers (they pass deterministically-ordered lists).
+/// The candidate nearest to `target`, if within the threshold. Ties go to the
+/// earliest candidate, so pass candidates in a deterministic order.
 pub fn closest<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let max_distance = threshold(target.len());
     let mut best: Option<(&str, usize)> = None;
@@ -24,7 +18,7 @@ pub fn closest<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>) 
     best.map(|(name, _)| name)
 }
 
-/// The maximum edit distance tolerated for a target of the given length.
+/// The largest edit distance accepted for a target of `len` bytes.
 fn threshold(len: usize) -> usize {
     match len {
         0..=2 => 1,
@@ -33,8 +27,7 @@ fn threshold(len: usize) -> usize {
     }
 }
 
-/// The Levenshtein edit distance between two strings, computed over Unicode
-/// scalar values with the standard two-row dynamic-programming table.
+/// Levenshtein distance over `char`s, using two rows of the DP table.
 fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();

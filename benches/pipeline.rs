@@ -1,8 +1,5 @@
-//! Criterion benchmarks for the Lumen compiler pipeline.
-//!
-//! Each phase is benchmarked in isolation on a fixed, representative program,
-//! plus an end-to-end `source → bytecode` measurement and a VM execution
-//! measurement. Inputs are constant so results are reproducible across runs.
+//! Criterion benchmarks: each phase on its own, the whole compile, and a VM
+//! run, all on one fixed program.
 
 use std::hint::black_box;
 

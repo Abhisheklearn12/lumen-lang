@@ -1,12 +1,8 @@
-//! Token kinds produced by the [lexer](super) and consumed by the
-//! [parser](crate::parser).
+//! Tokens: the [lexer](super)'s output and the [parser](crate::parser)'s input.
 //!
-//! Literal tokens carry their *parsed* value (`Int(i64)`, `Float(f64)`,
-//! `Str(String)`). Doing the conversion in the lexer keeps a single source of
-//! truth for literal syntax and lets the parser stay free of numeric parsing.
-//! The trade-off  that `TokenKind` is not `Copy` and not `Eq` (because of the
-//! `f64`)  is handled by [`TokenKind::same_kind`], which compares variants
-//! without comparing payloads.
+//! Literal tokens carry their parsed value, so literal syntax lives only in the
+//! lexer. The payloads make [`TokenKind`] neither `Copy` nor `Eq` (`f64`), so the
+//! parser matches kinds with [`TokenKind::same_kind`].
 
 use crate::span::Span;
 use std::mem;
@@ -21,7 +17,7 @@ pub enum TokenKind {
     Float(f64),
     /// String literal with escapes already resolved.
     Str(String),
-    /// Identifier (also covers type names like `i64`, resolved later).
+    /// Identifier, including type names such as `i64`.
     Ident(String),
 
     // ---- Keywords ----
@@ -77,16 +73,13 @@ pub enum TokenKind {
     Dot,
     DotDot,
 
-    /// End-of-input sentinel. Always the final token in a stream.
+    /// End of input; always the last token.
     Eof,
 }
 
 impl TokenKind {
-    /// Maps an identifier string to its keyword kind, if it is one.
-    ///
-    /// Primitive type names (`i64`, `bool`, …) are deliberately *not* keywords:
-    /// they are ordinary identifiers recognised contextually by the parser,
-    /// which keeps the type grammar open to extension without touching the lexer.
+    /// The keyword spelled `ident`, if any. Type names such as `i64` are not
+    /// keywords; they resolve during type checking.
     pub fn keyword(ident: &str) -> Option<TokenKind> {
         Some(match ident {
             "fn" => TokenKind::Fn,
@@ -109,16 +102,12 @@ impl TokenKind {
         })
     }
 
-    /// Whether two kinds are the same variant, ignoring any payload.
-    ///
-    /// The parser uses this to match against expected punctuation/keywords
-    /// without having to construct a payload for literal/ident variants.
+    /// Whether two kinds are the same variant, ignoring payloads.
     pub fn same_kind(&self, other: &TokenKind) -> bool {
         mem::discriminant(self) == mem::discriminant(other)
     }
 
-    /// A short, human-readable description for diagnostics, e.g. `` `+` `` or
-    /// `keyword `fn``. Used to render "expected X, found Y" messages.
+    /// How diagnostics name this token, e.g. `` `+` `` or `integer literal`.
     pub fn describe(&self) -> String {
         use TokenKind::*;
         match self {
@@ -131,10 +120,8 @@ impl TokenKind {
         }
     }
 
-    /// The canonical spelling of a fixed token (keyword or punctuation).
-    ///
-    /// For literals and identifiers  which have no fixed spelling  this
-    /// returns a placeholder; callers use [`describe`](Self::describe) for those.
+    /// The spelling of a keyword or punctuation token. Literals, identifiers,
+    /// and `Eof` have none and return `"<value>"`.
     pub fn symbol(&self) -> &'static str {
         use TokenKind::*;
         match self {
@@ -192,7 +179,7 @@ impl TokenKind {
     }
 }
 
-/// A token: its kind and the source span it covers.
+/// A token and the span it covers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,

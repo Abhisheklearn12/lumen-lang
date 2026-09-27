@@ -1,19 +1,13 @@
-//! Graphviz DOT export of the MIR control-flow graph.
-//!
-//! `lumenc dump cfg <file>` emits a `digraph` per function that can be rendered
-//! with Graphviz (`dot -Tpng`). Each basic block is a node listing its
-//! instructions and terminator; edges follow the terminator's successors, with
-//! the two arms of a conditional branch labelled `T` (true) and `F` (false).
-//!
-//! The rendering is deterministic, so it is also snapshot-testable.
+//! Graphviz output for `lumenc dump cfg`: a `digraph` per function with a node
+//! per block listing its code, and edges for control flow. A branch's edges
+//! are labelled `T` and `F`.
 
 use std::fmt::Write as _;
 
-use crate::hir::Callee;
+use super::print::{inst_str, operand};
 use crate::mir::*;
-use crate::sema::types::Builtin;
 
-/// Renders the whole program's CFG as one or more DOT digraphs.
+/// Renders each function's CFG as a DOT `digraph`.
 pub fn to_dot(program: &Program) -> String {
     let mut out = String::new();
     for func in &program.functions {
@@ -53,79 +47,18 @@ fn function_dot(out: &mut String, func: &Function) {
     out.push_str("}\n");
 }
 
-/// Escapes characters that are special inside a DOT label string.
+/// Escapes `\\` and `"` for a DOT label.
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn inst_str(inst: &Inst) -> String {
-    match inst {
-        Inst::Assign { dst, rvalue } => format!("%{} = {}", dst.0, rvalue_str(rvalue)),
-        Inst::Store { local, src } => format!("_{} <- {}", local.0, operand(src)),
-        Inst::SetIndex { base, index, value } => {
-            format!(
-                "{}[{}] <- {}",
-                operand(base),
-                operand(index),
-                operand(value)
-            )
-        }
-        Inst::Call {
-            dst, callee, args, ..
-        } => {
-            let args = args.iter().map(operand).collect::<Vec<_>>().join(", ");
-            format!("%{} = call {}({})", dst.0, callee_str(*callee), args)
-        }
-    }
-}
-
-fn rvalue_str(rvalue: &Rvalue) -> String {
-    match rvalue {
-        Rvalue::Use(o) => operand(o),
-        Rvalue::Load(l) => format!("load _{}", l.0),
-        Rvalue::Unary(op, o) => format!("{}{}", op.symbol(), operand(o)),
-        Rvalue::Binary(op, a, b) => format!("{} {} {}", operand(a), op.symbol(), operand(b)),
-        Rvalue::Concat(a, b) => format!("{} ++ {}", operand(a), operand(b)),
-        Rvalue::MakeArray(elems) => {
-            format!(
-                "[{}]",
-                elems.iter().map(operand).collect::<Vec<_>>().join(", ")
-            )
-        }
-        Rvalue::Index(b, i) => format!("{}[{}]", operand(b), operand(i)),
-    }
-}
-
+/// A terminator without its targets, which the edges show.
 fn term_str(term: &Terminator) -> String {
     match term {
         Terminator::Goto(b) => format!("goto bb{}", b.0),
         Terminator::Branch { cond, .. } => format!("branch {}", operand(cond)),
         Terminator::Return(o) => format!("return {}", operand(o)),
         Terminator::Unreachable => "unreachable".to_string(),
-    }
-}
-
-fn operand(o: &Operand) -> String {
-    match o {
-        Operand::Const(c) => const_str(c),
-        Operand::Reg(r) => format!("%{}", r.0),
-    }
-}
-
-fn const_str(c: &Const) -> String {
-    match c {
-        Const::Int(v) => v.to_string(),
-        Const::Float(v) => v.to_string(),
-        Const::Bool(v) => v.to_string(),
-        Const::Str(v) => format!("{v:?}"),
-        Const::Unit => "unit".to_string(),
-    }
-}
-
-fn callee_str(callee: Callee) -> String {
-    match callee {
-        Callee::Fn(id) => format!("fn#{}", id.0),
-        Callee::Builtin(b) => format!("@{}", Builtin::name(b)),
     }
 }
 

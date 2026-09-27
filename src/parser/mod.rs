@@ -1,49 +1,44 @@
-//! The parser: a hand-written recursive-descent parser with a Pratt
-//! (precedence-climbing) core for expressions.
+//! The parser: recursive descent, with precedence climbing for binary
+//! operators.
 //!
-//! # Design
+//! On a syntax error the parser reports it, skips to a stable boundary (the
+//! next `fn` or `const` at top level; past the next `;`, or up to the `}`, in
+//! a block) and carries on, always consuming at least one token so it cannot
+//! loop. Later phases still run on the partial [`Ast`].
 //!
-//! Recursive descent mirrors the grammar one function per production, which
-//! keeps the parser readable and the call stack a direct trace of the parse.
-//! Expressions use a single precedence-climbing routine ([`Parser::parse_bp`])
-//! driven by a [`binding_power`] table, avoiding a separate function per
-//! precedence level.
-//!
-//! # Error recovery
-//!
-//! The parser reports many errors per run. On a syntax error it emits a
-//! diagnostic, then *resynchronises* to a stable boundary  the next item at
-//! top level, or the next `;`/`}` inside a block  and continues. A progress
-//! guard guarantees forward motion so malformed input can never loop forever.
-//! The resulting (possibly partial) [`Ast`] lets later phases still run and
-//! surface their own diagnostics.
-//!
-//! # Grammar (informal EBNF)
+//! # Grammar
 //!
 //! ```text
 //! program  := item*
-//! item     := "fn" ident "(" params? ")" ("->" type)? block
-//! params   := param ("," param)* ","?
-//! param    := ident ":" type
-//! type     := ident
+//! item     := "fn" IDENT "(" list(IDENT ":" type) ")" ("->" type)? block
+//!           | "const" IDENT ":" type "=" expr ";"
+//!           | "struct" IDENT "{" list(IDENT ":" type) "}"
+//! type     := IDENT | "[" type "]" | "(" list(type) ")"
 //! block    := "{" stmt* expr? "}"
-//! stmt     := "let" "mut"? ident (":" type)? "=" expr ";"
+//! stmt     := "let" "mut"? IDENT (":" type)? "=" expr ";"
 //!           | "return" expr? ";"
 //!           | "while" expr block
-//!           | expr ";"
-//! expr     := assign
-//! assign   := or ("=" assign)?
-//! or       := and ("||" and)*
-//! and      := cmp ("&&" cmp)*
-//! cmp      := add (("=="|"!="|"<"|"<="|">"|">=") add)*
-//! add      := mul (("+"|"-") mul)*
-//! mul      := unary (("*"|"/"|"%") unary)*
-//! unary    := ("-"|"!") unary | call
-//! call     := primary ("(" args? ")")*
-//! primary  := int | float | string | "true" | "false" | ident
-//!           | "(" expr ")" | block | if
+//!           | "for" IDENT "in" expr (".." expr)? block
+//!           | "break" ";" | "continue" ";"
+//!           | expr ";" | block | if
+//! expr     := binary (("=" | "+=" | "-=" | "*=" | "/=" | "%=") expr)?
+//! binary   := unary (BINOP unary)*
+//! unary    := ("-" | "!") unary | postfix
+//! postfix  := primary ("(" list(expr) ")" | "[" expr "]" | "." (IDENT | INT))*
+//! primary  := INT | FLOAT | STRING | "true" | "false" | IDENT
+//!           | IDENT "{" list(IDENT ":" expr) "}"
+//!           | "(" list(expr) ")" | "[" list(expr) "]"
+//!           | block | if | match
 //! if       := "if" expr block ("else" (if | block))?
+//! match    := "match" expr "{" (pattern "=>" expr ","?)* "}"
+//! pattern  := "-"? INT | "true" | "false" | "_"
+//! list(x)  := (x ("," x)* ","?)?
 //! ```
+//!
+//! Binary operators are left-associative; from loosest to tightest: `||`,
+//! `&&`, `== !=`, `< <= > >=`, `+ -`, `* / %`. A struct literal cannot start in
+//! an `if`, `while`, or `match` head or a `for` bound, where `{` opens the body.
+//! A `match` arm needs a `,` unless its body is block-like or it is the last.
 
 pub mod ast;
 pub mod print;
@@ -55,10 +50,9 @@ use crate::errors::DiagCode;
 use crate::lexer::{Token, TokenKind};
 use crate::span::Span;
 
-/// Parses a token stream into an [`Ast`], reporting syntax errors into `diags`.
-///
-/// `tokens` must end with [`TokenKind::Eof`] (as produced by
-/// [`tokenize`](crate::lexer::tokenize)).
+/// Parses `tokens`, which must end with [`TokenKind::Eof`] as
+/// [`tokenize`](crate::lexer::tokenize) guarantees, reporting syntax errors to
+/// `diags`.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn parse(tokens: Vec<Token>, diags: &mut Diagnostics) -> Ast {
     let mut parser = Parser::new(tokens, diags);
@@ -72,17 +66,17 @@ struct Parser<'a> {
     pos: usize,
     ids: NodeIdGen,
     diags: &'a mut Diagnostics,
-    /// Whether a `Name { … }` may currently be parsed as a struct literal.
-    /// Disabled while parsing `if`/`while` conditions and `for` bounds, where a
-    /// trailing `{` instead begins the loop/branch body (the classic ambiguity).
+    /// Whether `Name {` may start a struct literal. Off in `if`/`while`/`match`
+    /// heads and `for` bounds, where `{` opens the body instead.
     struct_ok: bool,
 }
 
-/// One element parsed from inside a block: either a statement, the block's
-/// trailing value expression, or a recovered error.
+/// One element of a block.
 enum BlockElem {
     Stmt(Stmt),
+    /// The block's trailing value expression.
     Tail(Expr),
+    /// A syntax error, already reported.
     Error,
 }
 
@@ -97,8 +91,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Runs `f` with struct-literal parsing toggled, restoring the previous
-    /// setting afterward.
+    /// Runs `f` with `struct_ok` set to `allowed`, then restores it.
     fn with_struct_ok<T>(&mut self, allowed: bool, f: impl FnOnce(&mut Self) -> T) -> T {
         let saved = self.struct_ok;
         self.struct_ok = allowed;
@@ -107,18 +100,16 @@ impl<'a> Parser<'a> {
         result
     }
 
-    /// The kind of the token `n` positions ahead of the cursor.
-    fn nth_kind(&self, n: usize) -> &TokenKind {
-        let idx = (self.pos + n).min(self.tokens.len() - 1);
-        &self.tokens[idx].kind
-    }
-
     // ---- token cursor ----
 
+    /// The token `n` places ahead. The stream ends in `Eof`, which is returned
+    /// for any position past the end.
+    fn nth(&self, n: usize) -> &Token {
+        &self.tokens[(self.pos + n).min(self.tokens.len() - 1)]
+    }
+
     fn cur(&self) -> &Token {
-        // The stream always ends in Eof, so the final token is a valid sentinel
-        // and indexing the last position can never go out of bounds.
-        &self.tokens[self.pos.min(self.tokens.len() - 1)]
+        self.nth(0)
     }
 
     fn kind(&self) -> &TokenKind {
@@ -138,7 +129,7 @@ impl<'a> Parser<'a> {
         self.kind().same_kind(k)
     }
 
-    /// Consumes and returns the current token, stopping at `Eof`.
+    /// Consumes and returns the current token; `Eof` is never consumed.
     fn bump(&mut self) -> Token {
         let tok = self.cur().clone();
         if !self.at_eof() {
@@ -147,19 +138,31 @@ impl<'a> Parser<'a> {
         tok
     }
 
-    /// Consumes the current token if it matches `k`.
+    /// Consumes the current token if it is a `k`.
     fn eat(&mut self, k: &TokenKind) -> Option<Token> {
         if self.at(k) { Some(self.bump()) } else { None }
     }
 
-    /// Consumes a token of kind `k`, or reports "expected … found …".
+    /// Consumes a `k`, or reports "expected `k`, found ...".
     fn expect(&mut self, k: &TokenKind) -> Option<Token> {
-        if self.at(k) {
-            Some(self.bump())
-        } else {
+        let tok = self.eat(k);
+        if tok.is_none() {
             self.error_expected(k.describe());
-            None
         }
+        tok
+    }
+
+    /// Consumes an identifier, if the current token is one.
+    fn eat_ident(&mut self) -> Option<Ident> {
+        let TokenKind::Ident(name) = self.kind() else {
+            return None;
+        };
+        let ident = Ident {
+            name: name.clone(),
+            span: self.span(),
+        };
+        self.bump();
+        Some(ident)
     }
 
     fn fresh_id(&mut self) -> NodeId {
@@ -172,6 +175,22 @@ impl<'a> Parser<'a> {
             kind,
             span,
         }
+    }
+
+    /// Parses `list(item)` up to, but not including, `close`.
+    fn parse_comma_list<T>(
+        &mut self,
+        close: &TokenKind,
+        mut item: impl FnMut(&mut Self) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        let mut items = Vec::new();
+        while !self.at(close) && !self.at_eof() {
+            items.push(item(self)?);
+            if self.eat(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        Some(items)
     }
 
     // ---- diagnostics ----
@@ -204,10 +223,7 @@ impl<'a> Parser<'a> {
                 Some(item) => items.push(item),
                 None => {
                     self.recover_to_item();
-                    // Guarantee progress even if recovery found nothing to skip.
-                    if self.pos == before && !self.at_eof() {
-                        self.bump();
-                    }
+                    self.force_progress(before);
                 }
             }
         }
@@ -231,21 +247,13 @@ impl<'a> Parser<'a> {
         self.bump(); // `struct`
         let name = self.parse_ident()?;
         self.expect(&TokenKind::LBrace)?;
-        let mut fields = Vec::new();
-        while !self.at(&TokenKind::RBrace) && !self.at_eof() {
-            let field_name = self.parse_ident()?;
-            self.expect(&TokenKind::Colon)?;
-            let ty = self.parse_type();
-            let span = field_name.span.to(ty.span);
-            fields.push(FieldDef {
-                name: field_name,
-                ty,
-                span,
-            });
-            if self.eat(&TokenKind::Comma).is_none() {
-                break;
-            }
-        }
+        let fields = self.parse_comma_list(&TokenKind::RBrace, |p| {
+            let name = p.parse_ident()?;
+            p.expect(&TokenKind::Colon)?;
+            let ty = p.parse_type();
+            let span = name.span.to(ty.span);
+            Some(FieldDef { name, ty, span })
+        })?;
         let close = self.expect(&TokenKind::RBrace)?;
         let span = start.to(close.span);
         Some(Item {
@@ -286,7 +294,18 @@ impl<'a> Parser<'a> {
         self.bump(); // `fn`
         let name = self.parse_ident()?;
         self.expect(&TokenKind::LParen)?;
-        let params = self.parse_params()?;
+        let params = self.parse_comma_list(&TokenKind::RParen, |p| {
+            let name = p.parse_ident()?;
+            p.expect(&TokenKind::Colon)?;
+            let ty = p.parse_type();
+            let span = name.span.to(ty.span);
+            Some(Param {
+                id: p.fresh_id(),
+                name,
+                ty,
+                span,
+            })
+        })?;
         self.expect(&TokenKind::RParen)?;
         let ret = if self.eat(&TokenKind::Arrow).is_some() {
             Some(self.parse_type())
@@ -307,41 +326,16 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_params(&mut self) -> Option<Vec<Param>> {
-        let mut params = Vec::new();
-        while !self.at(&TokenKind::RParen) && !self.at_eof() {
-            let name = self.parse_ident()?;
-            self.expect(&TokenKind::Colon)?;
-            let ty = self.parse_type();
-            let span = name.span.to(ty.span);
-            params.push(Param {
-                id: self.fresh_id(),
-                name,
-                ty,
-                span,
-            });
-            if self.eat(&TokenKind::Comma).is_none() {
-                break;
-            }
-        }
-        Some(params)
-    }
-
     fn parse_ident(&mut self) -> Option<Ident> {
-        if let TokenKind::Ident(name) = self.kind() {
-            let name = name.clone();
-            let span = self.span();
-            self.bump();
-            Some(Ident { name, span })
-        } else {
+        let ident = self.eat_ident();
+        if ident.is_none() {
             self.error_expected("an identifier");
-            None
         }
+        ident
     }
 
-    /// Parses a type annotation. Never returns `None`: on a malformed type it
-    /// reports an error and yields a [`TypeExprKind::Error`] placeholder so the
-    /// surrounding construct can keep parsing.
+    /// Parses a type. Never fails: a malformed type is reported and becomes
+    /// [`TypeExprKind::Error`] so the enclosing construct can carry on.
     fn parse_type(&mut self) -> TypeExpr {
         if self.at(&TokenKind::LBracket) {
             let start = self.span();
@@ -359,18 +353,15 @@ impl<'a> Parser<'a> {
         if self.at(&TokenKind::LParen) {
             let start = self.span();
             self.bump(); // `(`
-            let mut elems = Vec::new();
-            while !self.at(&TokenKind::RParen) && !self.at_eof() {
-                elems.push(self.parse_type());
-                if self.eat(&TokenKind::Comma).is_none() {
-                    break;
-                }
-            }
+            // `parse_type` never fails, so neither does the list.
+            let elems = self
+                .parse_comma_list(&TokenKind::RParen, |p| Some(p.parse_type()))
+                .unwrap_or_default();
             let close = self
                 .expect(&TokenKind::RParen)
                 .map(|t| t.span)
                 .unwrap_or(start);
-            // `(T)` is just `T`; two or more elements form a tuple type.
+            // `(T)` is just `T`.
             return if elems.len() == 1 {
                 elems.into_iter().next().unwrap()
             } else {
@@ -380,27 +371,23 @@ impl<'a> Parser<'a> {
                 }
             };
         }
-        if let TokenKind::Ident(name) = self.kind() {
-            let name = name.clone();
-            let span = self.span();
-            self.bump();
-            TypeExpr {
-                kind: TypeExprKind::Named(name),
-                span,
-            }
-        } else {
-            let span = self.span();
-            self.diags.emit(
-                Diagnostic::error(
-                    DiagCode::ExpectedType,
-                    format!("expected a type, found {}", self.kind().describe()),
-                )
-                .with_primary(span, "expected a type name here"),
-            );
-            TypeExpr {
-                kind: TypeExprKind::Error,
-                span,
-            }
+        if let Some(ident) = self.eat_ident() {
+            return TypeExpr {
+                kind: TypeExprKind::Named(ident.name),
+                span: ident.span,
+            };
+        }
+        let span = self.span();
+        self.diags.emit(
+            Diagnostic::error(
+                DiagCode::ExpectedType,
+                format!("expected a type, found {}", self.kind().describe()),
+            )
+            .with_primary(span, "expected a type name here"),
+        );
+        TypeExpr {
+            kind: TypeExprKind::Error,
+            span,
         }
     }
 
@@ -408,55 +395,47 @@ impl<'a> Parser<'a> {
 
     fn parse_block(&mut self) -> Option<Block> {
         let open = self.expect(&TokenKind::LBrace)?;
-        // Inside a block, struct literals are unambiguous again (any `{` here
-        // would belong to a nested expression, not this block).
-        let saved_struct_ok = self.struct_ok;
-        self.struct_ok = true;
+        // A `{` inside the block cannot open this block's body, so struct
+        // literals are unambiguous again.
+        let (stmts, tail) = self.with_struct_ok(true, Self::parse_block_body);
+        let close = self
+            .expect(&TokenKind::RBrace)
+            .map_or_else(|| self.span(), |t| t.span);
+        Some(Block {
+            stmts,
+            tail,
+            span: open.span.to(close),
+        })
+    }
+
+    /// Parses a block's statements and tail, stopping before its `}`.
+    fn parse_block_body(&mut self) -> (Vec<Stmt>, Option<Box<Expr>>) {
         let mut stmts = Vec::new();
-        let mut tail = None;
         while !self.at(&TokenKind::RBrace) && !self.at_eof() {
             let before = self.pos;
             match self.parse_block_elem() {
                 BlockElem::Stmt(s) => stmts.push(s),
-                BlockElem::Tail(e) => {
-                    tail = Some(Box::new(e));
-                    break;
-                }
+                BlockElem::Tail(e) => return (stmts, Some(Box::new(e))),
                 BlockElem::Error => {
                     self.recover_in_block();
-                    if self.pos == before && !self.at_eof() {
-                        self.bump();
-                    }
+                    self.force_progress(before);
                 }
             }
         }
-        let close = self
-            .expect(&TokenKind::RBrace)
-            .unwrap_or_else(|| self.cur().clone());
-        self.struct_ok = saved_struct_ok;
-        Some(Block {
-            stmts,
-            tail,
-            span: open.span.to(close.span),
-        })
+        (stmts, None)
     }
 
     fn parse_block_elem(&mut self) -> BlockElem {
-        match self.kind() {
-            TokenKind::Let => self.parse_let().map_or(BlockElem::Error, BlockElem::Stmt),
-            TokenKind::Return => self
-                .parse_return()
-                .map_or(BlockElem::Error, BlockElem::Stmt),
-            TokenKind::While => self.parse_while().map_or(BlockElem::Error, BlockElem::Stmt),
-            TokenKind::For => self.parse_for().map_or(BlockElem::Error, BlockElem::Stmt),
-            TokenKind::Break => self
-                .parse_loop_jump(TokenKind::Break, StmtKind::Break)
-                .map_or(BlockElem::Error, BlockElem::Stmt),
-            TokenKind::Continue => self
-                .parse_loop_jump(TokenKind::Continue, StmtKind::Continue)
-                .map_or(BlockElem::Error, BlockElem::Stmt),
-            _ => self.parse_expr_stmt_or_tail(),
-        }
+        let stmt = match self.kind() {
+            TokenKind::Let => self.parse_let(),
+            TokenKind::Return => self.parse_return(),
+            TokenKind::While => self.parse_while(),
+            TokenKind::For => self.parse_for(),
+            TokenKind::Break => self.parse_loop_jump(StmtKind::Break),
+            TokenKind::Continue => self.parse_loop_jump(StmtKind::Continue),
+            _ => return self.parse_expr_stmt_or_tail(),
+        };
+        stmt.map_or(BlockElem::Error, BlockElem::Stmt)
     }
 
     fn parse_let(&mut self) -> Option<Stmt> {
@@ -488,7 +467,6 @@ impl<'a> Parser<'a> {
     fn parse_return(&mut self) -> Option<Stmt> {
         let start = self.span();
         self.bump(); // `return`
-        // `return;` returns unit; otherwise an expression precedes the `;`.
         let value = if self.at(&TokenKind::Semi) {
             None
         } else {
@@ -504,7 +482,7 @@ impl<'a> Parser<'a> {
     fn parse_while(&mut self) -> Option<Stmt> {
         let start = self.span();
         self.bump(); // `while`
-        let cond = self.with_struct_ok(false, |p| p.parse_expr())?;
+        let cond = self.with_struct_ok(false, Self::parse_expr)?;
         let body = self.parse_block()?;
         let span = start.to(body.span);
         Some(Stmt {
@@ -513,56 +491,52 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parses `for v in start..end` (a range loop) or `for v in array`.
     fn parse_for(&mut self) -> Option<Stmt> {
         let start = self.span();
         self.bump(); // `for`
         let var = self.parse_ident()?;
         self.expect(&TokenKind::In)?;
-        let first = self.with_struct_ok(false, |p| p.parse_expr())?;
-        // `for v in start..end` is a range loop; `for v in expr` iterates the
-        // elements of an array. The `..` after the first expression decides.
-        if self.eat(&TokenKind::DotDot).is_some() {
-            let range_end = self.with_struct_ok(false, |p| p.parse_expr())?;
-            let body = self.parse_block()?;
-            let span = start.to(body.span);
-            return Some(Stmt {
-                kind: StmtKind::For(ForStmt {
-                    id: self.fresh_id(),
-                    var,
-                    start: first,
-                    end: range_end,
-                    body,
-                }),
-                span,
-            });
-        }
+        let first = self.with_struct_ok(false, Self::parse_expr)?;
+        let range_end = if self.eat(&TokenKind::DotDot).is_some() {
+            Some(self.with_struct_ok(false, Self::parse_expr)?)
+        } else {
+            None
+        };
         let body = self.parse_block()?;
         let span = start.to(body.span);
-        Some(Stmt {
-            kind: StmtKind::ForEach(ForEachStmt {
-                id: self.fresh_id(),
+        let id = self.fresh_id();
+        let kind = match range_end {
+            Some(end) => StmtKind::For(ForStmt {
+                id,
+                var,
+                start: first,
+                end,
+                body,
+            }),
+            None => StmtKind::ForEach(ForEachStmt {
+                id,
                 var,
                 iterable: first,
                 body,
             }),
-            span,
-        })
+        };
+        Some(Stmt { kind, span })
     }
 
-    /// Parses a `break;` or `continue;` statement.
-    fn parse_loop_jump(&mut self, keyword: TokenKind, kind: StmtKind) -> Option<Stmt> {
+    /// Parses `break;` or `continue;`, producing `kind`.
+    fn parse_loop_jump(&mut self, kind: StmtKind) -> Option<Stmt> {
         let start = self.span();
         self.bump(); // `break` / `continue`
         let semi = self.expect(&TokenKind::Semi)?;
-        debug_assert!(matches!(keyword, TokenKind::Break | TokenKind::Continue));
         Some(Stmt {
             kind,
             span: start.to(semi.span),
         })
     }
 
-    /// Parses an expression in statement position and decides whether it is a
-    /// statement (`expr;` or a block-like expression) or the block's tail value.
+    /// Parses an expression in statement position: `expr;`, a block-like
+    /// expression standing alone, or the block's tail if `}` follows.
     fn parse_expr_stmt_or_tail(&mut self) -> BlockElem {
         let Some(expr) = self.parse_expr() else {
             return BlockElem::Error;
@@ -576,7 +550,6 @@ impl<'a> Parser<'a> {
         } else if self.at(&TokenKind::RBrace) {
             BlockElem::Tail(expr)
         } else if expr.is_block_like() {
-            // `if …` / `{ … }` may stand alone as a statement, like in Rust.
             let span = expr.span;
             BlockElem::Stmt(Stmt {
                 kind: StmtKind::Expr(expr),
@@ -588,14 +561,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ---- expressions (Pratt) ----
+    // ---- expressions ----
 
     fn parse_expr(&mut self) -> Option<Expr> {
         self.parse_assign()
     }
 
-    /// Assignment is the lowest-precedence, right-associative expression form.
-    /// Plain `=` and compound `+=`/`-=`/`*=`/`/=`/`%=` are handled here.
+    /// Parses `=` and the compound assignments, which bind loosest and
+    /// associate to the right.
     fn parse_assign(&mut self) -> Option<Expr> {
         let lhs = self.parse_bp(0)?;
         if self.at(&TokenKind::Eq) {
@@ -626,8 +599,8 @@ impl<'a> Parser<'a> {
         Some(lhs)
     }
 
-    /// Precedence-climbing core: parses binary operators whose left binding
-    /// power is at least `min_bp`.
+    /// Precedence climbing: parses binary operators whose left binding power
+    /// is at least `min_bp`.
     fn parse_bp(&mut self, min_bp: u8) -> Option<Expr> {
         let mut lhs = self.parse_unary()?;
         while let Some(op) = peek_binop(self.kind()) {
@@ -654,7 +627,7 @@ impl<'a> Parser<'a> {
         let op = match self.kind() {
             TokenKind::Minus => UnOp::Neg,
             TokenKind::Bang => UnOp::Not,
-            _ => return self.parse_call(),
+            _ => return self.parse_postfix(),
         };
         let start = self.span();
         self.bump();
@@ -669,20 +642,16 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Parses postfix calls `f(...)`, indexing `a[i]`, and field access `a.b`,
-    /// which chain freely.
-    fn parse_call(&mut self) -> Option<Expr> {
+    /// Parses a primary followed by any chain of calls `f(...)`, indexing
+    /// `a[i]`, field accesses `a.b`, and tuple indexing `a.0`.
+    fn parse_postfix(&mut self) -> Option<Expr> {
         let mut expr = self.parse_primary()?;
         loop {
             if self.at(&TokenKind::LParen) {
                 self.bump(); // `(`
-                let mut args = Vec::new();
-                while !self.at(&TokenKind::RParen) && !self.at_eof() {
-                    args.push(self.with_struct_ok(true, |p| p.parse_expr())?);
-                    if self.eat(&TokenKind::Comma).is_none() {
-                        break;
-                    }
-                }
+                let args = self.parse_comma_list(&TokenKind::RParen, |p| {
+                    p.with_struct_ok(true, Self::parse_expr)
+                })?;
                 let close = self.expect(&TokenKind::RParen)?;
                 let span = expr.span.to(close.span);
                 expr = self.mk_expr(
@@ -694,7 +663,7 @@ impl<'a> Parser<'a> {
                 );
             } else if self.at(&TokenKind::LBracket) {
                 self.bump(); // `[`
-                let index = self.with_struct_ok(true, |p| p.parse_expr())?;
+                let index = self.with_struct_ok(true, Self::parse_expr)?;
                 let close = self.expect(&TokenKind::RBracket)?;
                 let span = expr.span.to(close.span);
                 expr = self.mk_expr(
@@ -706,7 +675,6 @@ impl<'a> Parser<'a> {
                 );
             } else if self.at(&TokenKind::Dot) {
                 self.bump(); // `.`
-                // `.0` is a tuple index; `.name` is a struct field access.
                 if let TokenKind::Int(n) = self.kind() {
                     let index = (*n).max(0) as usize;
                     let index_span = self.span();
@@ -746,10 +714,8 @@ impl<'a> Parser<'a> {
             TokenKind::Str(s) => ExprKind::Str(s.clone()),
             TokenKind::True => ExprKind::Bool(true),
             TokenKind::False => ExprKind::Bool(false),
-            // `Name { ... }` is a struct literal, but only where allowed (not in
-            // a condition position, where `{` starts a block).
             TokenKind::Ident(_)
-                if self.struct_ok && matches!(self.nth_kind(1), TokenKind::LBrace) =>
+                if self.struct_ok && matches!(self.nth(1).kind, TokenKind::LBrace) =>
             {
                 return self.parse_struct_lit();
             }
@@ -775,13 +741,9 @@ impl<'a> Parser<'a> {
     fn parse_array_lit(&mut self) -> Option<Expr> {
         let start = self.span();
         self.bump(); // `[`
-        let mut elems = Vec::new();
-        while !self.at(&TokenKind::RBracket) && !self.at_eof() {
-            elems.push(self.with_struct_ok(true, |p| p.parse_expr())?);
-            if self.eat(&TokenKind::Comma).is_none() {
-                break;
-            }
-        }
+        let elems = self.parse_comma_list(&TokenKind::RBracket, |p| {
+            p.with_struct_ok(true, Self::parse_expr)
+        })?;
         let close = self.expect(&TokenKind::RBracket)?;
         let span = start.to(close.span);
         Some(self.mk_expr(ExprKind::ArrayLit(elems), span))
@@ -791,33 +753,26 @@ impl<'a> Parser<'a> {
     fn parse_struct_lit(&mut self) -> Option<Expr> {
         let name = self.parse_ident()?;
         self.expect(&TokenKind::LBrace)?;
-        let mut fields = Vec::new();
-        while !self.at(&TokenKind::RBrace) && !self.at_eof() {
-            let field_name = self.parse_ident()?;
-            self.expect(&TokenKind::Colon)?;
-            let value = self.with_struct_ok(true, |p| p.parse_expr())?;
-            fields.push(FieldInit {
-                name: field_name,
-                value,
-            });
-            if self.eat(&TokenKind::Comma).is_none() {
-                break;
-            }
-        }
+        let fields = self.parse_comma_list(&TokenKind::RBrace, |p| {
+            let name = p.parse_ident()?;
+            p.expect(&TokenKind::Colon)?;
+            let value = p.with_struct_ok(true, Self::parse_expr)?;
+            Some(FieldInit { name, value })
+        })?;
         let close = self.expect(&TokenKind::RBrace)?;
         let span = name.span.to(close.span);
         Some(self.mk_expr(ExprKind::StructLit { name, fields }, span))
     }
 
-    /// Parses `( ... )`: either a parenthesised expression (one element) or a
-    /// tuple literal (two or more).
+    /// Parses `( ... )`: `(e)` is a grouped expression; anything else, including
+    /// `()` and `(e,)`, is a tuple literal.
     fn parse_grouping(&mut self) -> Option<Expr> {
         let start = self.span();
         self.bump(); // `(`
         let mut elems = Vec::new();
         let mut saw_comma = false;
         while !self.at(&TokenKind::RParen) && !self.at_eof() {
-            elems.push(self.with_struct_ok(true, |p| p.parse_expr())?);
+            elems.push(self.with_struct_ok(true, Self::parse_expr)?);
             if self.eat(&TokenKind::Comma).is_some() {
                 saw_comma = true;
             } else {
@@ -826,7 +781,6 @@ impl<'a> Parser<'a> {
         }
         let close = self.expect(&TokenKind::RParen)?;
         if elems.len() == 1 && !saw_comma {
-            // `(e)` is just a grouped expression.
             return Some(elems.into_iter().next().unwrap());
         }
         let span = start.to(close.span);
@@ -836,7 +790,7 @@ impl<'a> Parser<'a> {
     fn parse_if(&mut self) -> Option<Expr> {
         let start = self.span();
         self.bump(); // `if`
-        let cond = self.with_struct_ok(false, |p| p.parse_expr())?;
+        let cond = self.with_struct_ok(false, Self::parse_expr)?;
         let then_branch = self.parse_block()?;
         let mut end = then_branch.span;
         let else_branch = if self.eat(&TokenKind::Else).is_some() {
@@ -867,14 +821,14 @@ impl<'a> Parser<'a> {
     fn parse_match(&mut self) -> Option<Expr> {
         let start = self.span();
         self.bump(); // `match`
-        let scrutinee = self.with_struct_ok(false, |p| p.parse_expr())?;
+        let scrutinee = self.with_struct_ok(false, Self::parse_expr)?;
         self.expect(&TokenKind::LBrace)?;
         let mut arms = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at_eof() {
             let arm_start = self.span();
             let pattern = self.parse_pattern()?;
             self.expect(&TokenKind::FatArrow)?;
-            let body = self.with_struct_ok(true, |p| p.parse_expr())?;
+            let body = self.with_struct_ok(true, Self::parse_expr)?;
             let span = arm_start.to(body.span);
             let block_like = matches!(
                 body.kind,
@@ -885,8 +839,6 @@ impl<'a> Parser<'a> {
                 body,
                 span,
             });
-            // A comma separates arms. It is optional after a block-like body
-            // (`{ ... }`, `if`, `match`), matching Rust, and after the final arm.
             if self.eat(&TokenKind::Comma).is_none() && !block_like {
                 break;
             }
@@ -902,7 +854,6 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Parses a single `match` arm pattern: a scalar literal or `_`.
     fn parse_pattern(&mut self) -> Option<Pattern> {
         match self.kind() {
             TokenKind::Int(v) => {
@@ -945,15 +896,14 @@ impl<'a> Parser<'a> {
 
     // ---- recovery ----
 
-    /// Skips tokens until the next top-level item boundary (`fn`, `const`, EOF).
+    /// Skips to the next `fn` or `const`, or to EOF.
     fn recover_to_item(&mut self) {
         while !self.at_eof() && !self.at(&TokenKind::Fn) && !self.at(&TokenKind::Const) {
             self.bump();
         }
     }
 
-    /// Skips to the end of the current statement: past the next `;`, or up to
-    /// the closing `}` of the block.
+    /// Skips past the next `;`, or up to the block's `}`.
     fn recover_in_block(&mut self) {
         while !self.at_eof() && !self.at(&TokenKind::RBrace) {
             let was_semi = self.at(&TokenKind::Semi);
@@ -963,9 +913,17 @@ impl<'a> Parser<'a> {
             }
         }
     }
+
+    /// Skips one token if nothing was consumed since `before`, so error
+    /// recovery always makes progress.
+    fn force_progress(&mut self, before: usize) {
+        if self.pos == before && !self.at_eof() {
+            self.bump();
+        }
+    }
 }
 
-/// Maps a compound-assignment token (`+=` …) to its underlying binary operator.
+/// The operator a compound-assignment token (`+=`, ...) applies.
 fn compound_assign_op(kind: &TokenKind) -> Option<BinOp> {
     Some(match kind {
         TokenKind::PlusEq => BinOp::Add,
@@ -977,7 +935,7 @@ fn compound_assign_op(kind: &TokenKind) -> Option<BinOp> {
     })
 }
 
-/// Maps a token to the binary operator it introduces, if any.
+/// The binary operator a token spells, if any.
 fn peek_binop(kind: &TokenKind) -> Option<BinOp> {
     Some(match kind {
         TokenKind::PipePipe => BinOp::Or,
@@ -997,18 +955,10 @@ fn peek_binop(kind: &TokenKind) -> Option<BinOp> {
     })
 }
 
-/// The (left, right) binding powers of a binary operator. All operators here
-/// are left-associative, encoded as `left < right`. Higher binds tighter.
+/// The (left, right) binding powers of `op`. Right exceeds left, which makes
+/// every operator left-associative.
 fn binding_power(op: BinOp) -> (u8, u8) {
-    use BinOp::*;
-    let level: u8 = match op {
-        Or => 1,
-        And => 2,
-        Eq | Ne => 3,
-        Lt | Le | Gt | Ge => 4,
-        Add | Sub => 5,
-        Mul | Div | Rem => 6,
-    };
+    let level = op.precedence();
     (level * 2, level * 2 + 1)
 }
 

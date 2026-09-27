@@ -1,34 +1,22 @@
-//! The bytecode: runtime [`Value`]s, the instruction set [`Op`], and the
-//! [`Program`]/[`Chunk`] container the VM executes.
+//! The bytecode: runtime [`Value`]s, the [`Op`] instruction set, and the
+//! [`Program`] the VM runs.
 //!
-//! # Design
-//!
-//! Instructions are a typed `enum` rather than packed bytes. The language
-//! prioritises maintainability over raw decode speed, and a typed instruction
-//! set is far easier to read, pattern-match, disassemble, and test than a byte
-//! buffer  while still being a flat, index-addressed sequence the VM steps
-//! through linearly.
-//!
-//! Because HIR is fully typed, arithmetic and comparison opcodes are
-//! *monomorphic* (`AddInt` vs `AddFloat`): the code generator picks the right
-//! one, so the VM never inspects operand types at runtime. Equality is the one
-//! exception  a single [`Op::Eq`]/[`Op::Ne`] compares any two values
-//! structurally, which is simpler than four typed variants and just as fast.
-//!
-//! Jumps are absolute instruction indices within a chunk, resolved by the code
-//! generator via backpatching.
+//! Instructions are an `enum`, not packed bytes: easier to read, match, and
+//! test, at some cost in decode speed. Arithmetic and ordering opcodes are
+//! typed (`AddInt`, `AddFloat`), chosen by the code generator from HIR types.
+//! Only [`Op::Eq`] and [`Op::Ne`] compare any two values. Jump targets are
+//! absolute indices into the chunk's code.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::sema::types::{Builtin, Elem};
 
-/// A shared, mutable array value with reference semantics.
+/// An array: shared and mutable, so copies alias.
 pub type Array = Rc<RefCell<Vec<Value>>>;
 
-/// A runtime value. Strings and arrays are reference-counted so cloning a
-/// `Value` (which the stack machine does constantly) is cheap. Arrays share
-/// their contents, matching the language's reference semantics.
+/// A runtime value. Strings and arrays are reference-counted, so cloning one
+/// is cheap. Structs and tuples are arrays of their fields.
 #[derive(Clone, Debug)]
 pub enum Value {
     Int(i64),
@@ -40,15 +28,13 @@ pub enum Value {
 }
 
 impl Value {
-    /// Interprets the value as a boolean for conditional branches. Only `Bool`
-    /// is ever produced in this position by the type checker; anything else
-    /// (impossible in well-typed code) is treated as `false`.
+    /// Whether this is `Bool(true)`; any other value counts as `false`.
     pub fn as_bool(&self) -> bool {
         matches!(self, Value::Bool(true))
     }
 
-    /// Structural equality used by `Op::Eq`/`Op::Ne`. Mirrors source `==`:
-    /// floats use IEEE equality, strings compare by contents.
+    /// The equality behind `==`: IEEE for floats, by contents for strings and
+    /// arrays.
     pub fn value_eq(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
@@ -87,8 +73,8 @@ impl std::fmt::Display for Value {
     }
 }
 
-/// A single VM instruction. Each is documented with its stack effect as
-/// `[before] -> [after]` (top of stack on the right).
+/// A VM instruction. Stack effects are written `[before] -> [after]`, top of
+/// stack on the right.
 #[derive(Clone, Debug)]
 pub enum Op {
     /// `[] -> [int]`
@@ -99,14 +85,14 @@ pub enum Op {
     PushBool(bool),
     /// `[] -> [unit]`
     PushUnit,
-    /// Push string constant `consts[idx]`. `[] -> [str]`
+    /// Pushes `consts[idx]`. `[] -> [str]`
     PushStr(u32),
 
-    /// Push a copy of local slot `n`. `[] -> [v]`
+    /// Pushes local `n`. `[] -> [v]`
     LoadLocal(u32),
-    /// Pop and store into local slot `n`. `[v] -> []`
+    /// Pops into local `n`. `[v] -> []`
     StoreLocal(u32),
-    /// Discard the top value. `[v] -> []`
+    /// `[v] -> []`
     Pop,
 
     // Integer arithmetic: `[a, b] -> [a op b]`.
@@ -118,7 +104,7 @@ pub enum Op {
     /// `[a] -> [-a]`
     NegInt,
 
-    // Float arithmetic.
+    // Float arithmetic, likewise.
     AddFloat,
     SubFloat,
     MulFloat,
@@ -132,76 +118,94 @@ pub enum Op {
     GtInt,
     GeInt,
 
-    // Float ordering.
+    // Float ordering, likewise.
     LtFloat,
     LeFloat,
     GtFloat,
     GeFloat,
 
-    /// String concatenation. `[str, str] -> [str]`
+    /// `[str, str] -> [str]`
     ConcatStr,
 
-    /// Build an array from the top `n` values. `[v0..vn-1] -> [array]`
+    /// Builds an array of the top `n` values. `[v0 .. vn-1] -> [array]`
     MakeArray(u32),
-    /// Pop a length and push an array of that many zero values of the given
-    /// element type. `[int] -> [array]` (errors on a negative or oversized
-    /// length).
+    /// An array of `len` zero values; fails on a negative or oversized `len`.
+    /// `[len] -> [array]`
     ///
-    /// The length is a *runtime* value, but the stack effect is one-in
-    /// one-out regardless of it, so the verifier can still prove stack height
-    /// from the program counter alone. That is why this is a separate opcode
-    /// rather than a variable-count [`Op::MakeArray`].
+    /// Unlike a variable-count [`Op::MakeArray`], its stack effect does not
+    /// depend on the runtime length, so the verifier can still prove the stack
+    /// height at every instruction.
     NewArray(Elem),
-    /// Read `base[index]`. `[array, int] -> [v]` (errors if out of bounds).
+    /// Fails if out of bounds. `[array, int] -> [v]`
     Index,
-    /// Store `base[index] = value`, yielding unit. `[array, int, v] -> [unit]`
+    /// Fails if out of bounds. `[array, int, v] -> [unit]`
     SetIndex,
-    /// Push the length of an array. `[array] -> [int]`
+    /// `[array] -> [int]`
     ArrayLen,
 
-    /// Structural equality. `[a, b] -> [bool]`
+    /// `[a, b] -> [bool]`
     Eq,
-    /// Structural inequality. `[a, b] -> [bool]`
+    /// `[a, b] -> [bool]`
     Ne,
-    /// Boolean negation. `[bool] -> [bool]`
+    /// `[bool] -> [bool]`
     NotBool,
 
-    /// Unconditional jump to absolute index.
+    /// Jumps to an absolute index.
     Jump(usize),
-    /// Pop a bool; jump to absolute index if it is `false`. `[bool] -> []`
+    /// Pops a bool and jumps if it is `false`. `[bool] -> []`
     JumpIfFalse(usize),
 
-    /// Call user function `func` with `argc` arguments from the stack top.
+    /// Calls function `func`, whose parameters are the top `argc` values.
+    /// `[args..] -> [result]`
     Call {
         func: usize,
         argc: u8,
     },
-    /// Call a builtin with `argc` arguments. `[args..] -> [result]`
+    /// `[args..] -> [result]`
     CallBuiltin {
         builtin: Builtin,
         argc: u8,
     },
-    /// Return the top value to the caller.
+    /// Returns the top value to the caller.
     Return,
 }
 
-/// The compiled form of one function.
+impl Op {
+    /// The target of a `Jump` or `JumpIfFalse`.
+    pub fn jump_target(&self) -> Option<usize> {
+        match self {
+            Op::Jump(t) | Op::JumpIfFalse(t) => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// The target of a `Jump` or `JumpIfFalse`, for patching.
+    pub fn jump_target_mut(&mut self) -> Option<&mut usize> {
+        match self {
+            Op::Jump(t) | Op::JumpIfFalse(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// One compiled function.
 #[derive(Debug)]
 pub struct Chunk {
     pub name: String,
-    /// Total local slots, including parameters.
+    /// Local slots, including the parameters.
     pub n_locals: usize,
-    /// How many of the locals are parameters (the leading slots).
+    /// How many leading locals are parameters.
     pub n_params: usize,
     pub code: Vec<Op>,
-    /// String constant pool referenced by [`Op::PushStr`].
+    /// The strings [`Op::PushStr`] refers to.
     pub consts: Vec<Rc<str>>,
 }
 
-/// A whole compiled program: one [`Chunk`] per function plus the entry index.
+/// A compiled program.
 #[derive(Debug)]
 pub struct Program {
+    /// One chunk per function, indexed like [`Hir::functions`](crate::hir::Hir::functions).
     pub functions: Vec<Chunk>,
-    /// Index into [`Program::functions`] of `main`.
+    /// The index of `main` in `functions`.
     pub main: usize,
 }

@@ -1,125 +1,61 @@
-//! Constant folding, algebraic simplification, and constant-condition collapse.
+//! Constant folding, algebraic identities, and constant `if`s, in one
+//! post-order walk, so each node sees its operands already folded.
 //!
-//! Runs a single post-order walk: children are simplified before their parent,
-//! so a parent sees already-folded operands. Each rewrite is value-preserving:
-//!
-//! * **Constant folding**  operators on literal operands become a literal
-//!   (`1 + 2` → `3`, `1 < 2` → `true`). Integer arithmetic uses wrapping
-//!   semantics that match the VM exactly; division or remainder by zero is left
-//!   un-folded so the runtime error is preserved.
-//! * **Algebraic identities**  `x + 0`, `x * 1`, `x - 0` → `x`; `x * 0` → `0`
-//!   only when `x` is pure (otherwise its side effects must run).
-//! * **Short-circuit logic**  `true || x` → `true`, `false && x` → `false`,
-//!   etc., which is sound because `||`/`&&` would not evaluate `x` anyway.
-//! * **Constant conditions**  `if true { a } else { b }` → `a`.
+//! * Constants: operators on literals become a literal (`1 + 2` → `3`).
+//!   Integers wrap as in the VM; a division or remainder that would trap (by
+//!   zero, or `i64::MIN / -1`) is left for the runtime to report.
+//! * Identities: `x + 0`, `0 + x`, `x - 0`, `x * 1`, `1 * x` → `x`, and
+//!   `x * 0`, `0 * x` → `0` if `x` is pure. They also fire on floats, where
+//!   they are inexact: `-0.0 + 0.0` is `0.0`, and `x * 0.0` is `-0.0` or NaN
+//!   for negative or non-finite `x`.
+//! * Short-circuits with a literal left side: `true && x` → `x`,
+//!   `false && x` → `false`, `true || x` → `true`, `false || x` → `x`.
+//! * Constant conditions: `if true { a } else { b }` → `a`, and likewise for
+//!   `false`.
 
-use crate::hir::{BinOp, Block, Expr, ExprKind, Function, Hir, Stmt, UnOp};
-use crate::opt::{is_pure, unit_expr};
+use crate::hir::{BinOp, Block, Expr, ExprKind, Hir, UnOp};
+use crate::opt::{VisitMut, is_pure, unit_expr, walk_block_mut, walk_expr_mut};
 use crate::sema::types::Type;
+use crate::span::Span;
 
 /// Runs the fold pass over the whole program; returns the number of rewrites.
 pub fn run(hir: &mut Hir) -> usize {
-    let mut count = 0;
+    let mut folder = Folder { count: 0 };
     for func in &mut hir.functions {
-        fold_function(func, &mut count);
+        folder.visit_block(&mut func.body);
     }
-    count
+    folder.count
 }
 
-fn fold_function(func: &mut Function, count: &mut usize) {
-    fold_block(&mut func.body, count);
+struct Folder {
+    count: usize,
 }
 
-fn fold_block(block: &mut Block, count: &mut usize) {
-    for stmt in &mut block.stmts {
-        fold_stmt(stmt, count);
+impl VisitMut for Folder {
+    fn visit_block(&mut self, block: &mut Block) {
+        walk_block_mut(self, block);
+        if let Some(tail) = &block.tail {
+            block.ty = tail.ty;
+        }
     }
-    if let Some(tail) = &mut block.tail {
-        fold_expr(tail, count);
-        block.ty = tail.ty;
-    }
-}
 
-fn fold_stmt(stmt: &mut Stmt, count: &mut usize) {
-    match stmt {
-        Stmt::Let { value, .. } => fold_expr(value, count),
-        Stmt::Expr(e) => fold_expr(e, count),
-        Stmt::Return(e) => {
-            if let Some(e) = e {
-                fold_expr(e, count);
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        walk_expr_mut(self, expr);
+        // Take the kind so its children can be moved into a replacement; put
+        // it back if nothing applies.
+        let kind = std::mem::replace(&mut expr.kind, ExprKind::Bool(false));
+        match rewrite(kind, expr.ty, expr.span) {
+            Ok(replacement) => {
+                *expr = replacement;
+                self.count += 1;
             }
+            Err(kind) => expr.kind = kind,
         }
-        Stmt::While { cond, body } => {
-            fold_expr(cond, count);
-            fold_block(body, count);
-        }
-        Stmt::For {
-            start, end, body, ..
-        } => {
-            fold_expr(start, count);
-            fold_expr(end, count);
-            fold_block(body, count);
-        }
-        Stmt::Break | Stmt::Continue => {}
     }
 }
 
-fn fold_expr(expr: &mut Expr, count: &mut usize) {
-    // Post-order: fold children first so parents see folded operands.
-    match &mut expr.kind {
-        ExprKind::Unary { rhs, .. } => fold_expr(rhs, count),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            fold_expr(lhs, count);
-            fold_expr(rhs, count);
-        }
-        ExprKind::Call { args, .. } => args.iter_mut().for_each(|a| fold_expr(a, count)),
-        ExprKind::Assign { value, .. } => fold_expr(value, count),
-        ExprKind::ArrayLit(elems) => elems.iter_mut().for_each(|e| fold_expr(e, count)),
-        ExprKind::Index { base, index } => {
-            fold_expr(base, count);
-            fold_expr(index, count);
-        }
-        ExprKind::SetIndex { base, index, value } => {
-            fold_expr(base, count);
-            fold_expr(index, count);
-            fold_expr(value, count);
-        }
-        ExprKind::StructLit(fields) => fields.iter_mut().for_each(|e| fold_expr(e, count)),
-        ExprKind::GetField { base, .. } => fold_expr(base, count),
-        ExprKind::SetField { base, value, .. } => {
-            fold_expr(base, count);
-            fold_expr(value, count);
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            fold_expr(cond, count);
-            fold_block(then_branch, count);
-            if let Some(e) = else_branch {
-                fold_expr(e, count);
-            }
-        }
-        ExprKind::Block(block) => fold_block(block, count),
-        _ => {}
-    }
-
-    // Now attempt to rewrite this node. Take ownership of the kind so children
-    // can be moved freely, then either install a replacement or restore it.
-    let kind = std::mem::replace(&mut expr.kind, ExprKind::Bool(false));
-    match rewrite(kind, expr.ty, expr.span) {
-        Ok(replacement) => {
-            *expr = replacement;
-            *count += 1;
-        }
-        Err(kind) => expr.kind = kind,
-    }
-}
-
-/// Attempts to rewrite a single node. `Ok` is the replacement; `Err` returns the
-/// original kind unchanged.
-fn rewrite(kind: ExprKind, ty: Type, span: crate::span::Span) -> Result<Expr, ExprKind> {
+/// Rewrites one node: `Ok` holds the replacement, `Err` the unchanged kind.
+fn rewrite(kind: ExprKind, ty: Type, span: Span) -> Result<Expr, ExprKind> {
     match kind {
         ExprKind::Unary { op, rhs } => fold_unary(op, rhs, ty, span),
         ExprKind::Binary { op, lhs, rhs } => fold_binary(op, lhs, rhs, ty, span),
@@ -132,12 +68,7 @@ fn rewrite(kind: ExprKind, ty: Type, span: crate::span::Span) -> Result<Expr, Ex
     }
 }
 
-fn fold_unary(
-    op: UnOp,
-    rhs: Box<Expr>,
-    ty: Type,
-    span: crate::span::Span,
-) -> Result<Expr, ExprKind> {
+fn fold_unary(op: UnOp, rhs: Box<Expr>, ty: Type, span: Span) -> Result<Expr, ExprKind> {
     let folded = match (op, &rhs.kind) {
         (UnOp::Neg, ExprKind::Int(v)) => Some(ExprKind::Int(v.wrapping_neg())),
         (UnOp::Neg, ExprKind::Float(v)) => Some(ExprKind::Float(-v)),
@@ -155,15 +86,13 @@ fn fold_binary(
     lhs: Box<Expr>,
     rhs: Box<Expr>,
     ty: Type,
-    span: crate::span::Span,
+    span: Span,
 ) -> Result<Expr, ExprKind> {
-    // 1. Both operands constant: compute the result literal.
     if let Some(kind) = const_binary(op, &lhs.kind, &rhs.kind) {
         return Ok(Expr::new(kind, ty, span));
     }
 
-    // 2. Algebraic identities. Compute predicates up front (each borrow is
-    //    released immediately) so the operands can then be moved freely.
+    // Identities. Test the operands first, so they can then be moved.
     let l_zero = is_zero(&lhs.kind);
     let r_zero = is_zero(&rhs.kind);
     let l_one = is_one(&lhs.kind);
@@ -191,7 +120,7 @@ fn fold_binary(
             if l_one {
                 return Ok(*rhs);
             }
-            // `x * 0` → 0 only if `x` cannot have side effects.
+            // `x * 0` → `0` drops `x`, so only if it is pure.
             if r_zero && is_pure(&lhs) {
                 return Ok(*rhs);
             }
@@ -199,44 +128,38 @@ fn fold_binary(
                 return Ok(*lhs);
             }
         }
-        BinOp::And => {
-            // `true && x` → x ; `false && x` → false (lhs is a pure literal).
-            match l_bool {
-                Some(true) => return Ok(*rhs),
-                Some(false) => return Ok(*lhs),
-                None => {}
-            }
-        }
-        BinOp::Or => {
-            // `true || x` → true ; `false || x` → x.
-            match l_bool {
-                Some(true) => return Ok(*lhs),
-                Some(false) => return Ok(*rhs),
-                None => {}
-            }
-        }
+        BinOp::And => match l_bool {
+            Some(true) => return Ok(*rhs),
+            Some(false) => return Ok(*lhs),
+            None => {}
+        },
+        BinOp::Or => match l_bool {
+            Some(true) => return Ok(*lhs),
+            Some(false) => return Ok(*rhs),
+            None => {}
+        },
         _ => {}
     }
     Err(ExprKind::Binary { op, lhs, rhs })
 }
 
-/// Collapses an `if` whose condition folded to a constant.
+/// Collapses an `if` whose condition is a literal.
 fn fold_if(
     cond: Expr,
     then_branch: Block,
     else_branch: Option<Box<Expr>>,
     ty: Type,
-    span: crate::span::Span,
+    span: Span,
 ) -> Result<Expr, ExprKind> {
     let cond_span = cond.span;
     match cond.kind {
         ExprKind::Bool(true) => Ok(Expr::new(ExprKind::Block(then_branch), ty, span)),
         ExprKind::Bool(false) => match else_branch {
             Some(else_expr) => Ok(*else_expr),
-            // `if false { … }` with no else is just unit.
+            // `if false { ... }` without `else` is `unit`.
             None => Ok(unit_expr(span)),
         },
-        // Condition is not constant: rebuild unchanged.
+        // Not a literal: rebuild the `if` unchanged.
         other => {
             let cond = Box::new(Expr::new(other, Type::Bool, cond_span));
             Err(ExprKind::If {
@@ -248,15 +171,25 @@ fn fold_if(
     }
 }
 
-// ---- constant evaluation ----
-
-/// Folds a binary operator applied to two literal operands, if possible.
+/// `lhs op rhs` for two literals, if it can be computed at compile time.
 fn const_binary(op: BinOp, lhs: &ExprKind, rhs: &ExprKind) -> Option<ExprKind> {
     use ExprKind::{Bool, Float, Int, Str};
     match (lhs, rhs) {
-        (Int(a), Int(b)) => const_int(op, *a, *b),
-        (Float(a), Float(b)) => const_float(op, *a, *b),
-        (Bool(a), Bool(b)) => const_bool(op, *a, *b),
+        (Int(a), Int(b)) => op
+            .fold_int(*a, *b)
+            .map(Int)
+            .or_else(|| op.compare(a, b).map(Bool)),
+        (Float(a), Float(b)) => op
+            .fold_float(*a, *b)
+            .map(Float)
+            .or_else(|| op.compare(a, b).map(Bool)),
+        (Bool(a), Bool(b)) => match op {
+            BinOp::Eq => Some(Bool(a == b)),
+            BinOp::Ne => Some(Bool(a != b)),
+            BinOp::And => Some(Bool(*a && *b)),
+            BinOp::Or => Some(Bool(*a || *b)),
+            _ => None,
+        },
         (Str(a), Str(b)) => match op {
             BinOp::Eq => Some(Bool(a == b)),
             BinOp::Ne => Some(Bool(a != b)),
@@ -264,55 +197,6 @@ fn const_binary(op: BinOp, lhs: &ExprKind, rhs: &ExprKind) -> Option<ExprKind> {
         },
         _ => None,
     }
-}
-
-fn const_int(op: BinOp, a: i64, b: i64) -> Option<ExprKind> {
-    use ExprKind::{Bool, Int};
-    Some(match op {
-        BinOp::Add => Int(a.wrapping_add(b)),
-        BinOp::Sub => Int(a.wrapping_sub(b)),
-        BinOp::Mul => Int(a.wrapping_mul(b)),
-        // Preserve the runtime error: do not fold division/remainder by zero,
-        // nor the single overflowing case `i64::MIN / -1`.
-        BinOp::Div => Int(a.checked_div(b)?),
-        BinOp::Rem => Int(a.checked_rem(b)?),
-        BinOp::Eq => Bool(a == b),
-        BinOp::Ne => Bool(a != b),
-        BinOp::Lt => Bool(a < b),
-        BinOp::Le => Bool(a <= b),
-        BinOp::Gt => Bool(a > b),
-        BinOp::Ge => Bool(a >= b),
-        BinOp::And | BinOp::Or => return None,
-    })
-}
-
-fn const_float(op: BinOp, a: f64, b: f64) -> Option<ExprKind> {
-    use ExprKind::{Bool, Float};
-    Some(match op {
-        BinOp::Add => Float(a + b),
-        BinOp::Sub => Float(a - b),
-        BinOp::Mul => Float(a * b),
-        BinOp::Div => Float(a / b),
-        BinOp::Rem => Float(a % b),
-        BinOp::Eq => Bool(a == b),
-        BinOp::Ne => Bool(a != b),
-        BinOp::Lt => Bool(a < b),
-        BinOp::Le => Bool(a <= b),
-        BinOp::Gt => Bool(a > b),
-        BinOp::Ge => Bool(a >= b),
-        BinOp::And | BinOp::Or => return None,
-    })
-}
-
-fn const_bool(op: BinOp, a: bool, b: bool) -> Option<ExprKind> {
-    use ExprKind::Bool;
-    Some(match op {
-        BinOp::Eq => Bool(a == b),
-        BinOp::Ne => Bool(a != b),
-        BinOp::And => Bool(a && b),
-        BinOp::Or => Bool(a || b),
-        _ => return None,
-    })
 }
 
 // ---- literal predicates ----

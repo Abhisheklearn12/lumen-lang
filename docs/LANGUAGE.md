@@ -28,7 +28,7 @@ can refer to a function declared later in the file.
 | `str`       | immutable UTF-8 string            | `"hello"`, `"a\nb"`     |
 | `unit`      | the empty "no value" type         | (implicit)              |
 | `[T]`       | array of a primitive element type | `[1, 2, 3]`             |
-| `(A, B, …)` | tuple of two or more types        | `(1, true)`             |
+| `(A, B, …)` | tuple of values of any types      | `(1, true)`             |
 | `struct`    | named record of fields            | `Point { x: 1, y: 2 }`  |
 
 There are **no implicit conversions**: `i64` and `f64` never mix in an operator,
@@ -73,10 +73,11 @@ fn main() {
 }
 ```
 
-A struct literal must give every declared field exactly once; missing, extra,
-duplicate, or unknown fields are an error (`E0317`). Fields are read and written
-with `.name`. Structs have reference semantics: assigning a struct value shares
-its storage rather than copying it.
+A struct literal must give every declared field exactly once: a missing or
+repeated field is an error (`E0317`), and so is an unknown one (`E0316`). The
+field values are evaluated in declaration order, whatever order they are
+written in. Fields are read and written with `.name`. Structs have reference
+semantics: assigning a struct value shares its storage rather than copying it.
 
 ## Arrays
 
@@ -120,9 +121,10 @@ let a = pair.0;
 let b = pair.1;
 ```
 
-A tuple groups two or more values of possibly different types. Elements are read
+A tuple groups values of possibly different types. Elements are read
 positionally with `.0`, `.1`, and so on. A parenthesised single expression is
-just grouping, not a one-element tuple.
+just grouping; `(e,)` is a one-element tuple and `()` an empty one. In a type,
+`(T)` and `(T,)` both mean `T`, so a one-element tuple type cannot be written.
 
 ## Bindings
 
@@ -192,14 +194,15 @@ already determines the result. Assignment (`=`) is a separate, right-associative
 form whose value is `unit`.
 
 Arithmetic operators apply to `i64` and `f64`; comparisons (`<`, and so on) apply
-to the numeric types; `==`/`!=` apply to any single type; `&&`/`||`/`!` apply to
-`bool`. The `+` operator also concatenates two `str` values. Integer arithmetic
-**wraps** on overflow. Integer division or remainder by zero is a runtime error.
+to the numeric types; `==`/`!=` apply to two values of the same type other than
+`unit`; `&&`/`||`/`!` apply to `bool`. The `+` operator also concatenates two
+`str` values. Integer arithmetic **wraps** on overflow. Integer division or
+remainder by zero is a runtime error, as is `i64::MIN / -1` or `i64::MIN % -1`.
 
 ## Statements
 
 - `let [mut] name [: type] = expr;`
-- `expr;` to evaluate for effect
+- `expr;` to evaluate for effect; an `if` or a block needs no `;`
 - `return [expr];`
 - `while cond { ... }` where `cond` must be `bool`
 - `for v in start..end { ... }` over the half-open integer range `[start, end)`
@@ -235,7 +238,8 @@ Each prints its argument followed by a newline.
 | `char_to_str(i64)`    | `-> str`   |
 
 `to_int` truncates toward zero; `parse_int` yields `0` on a malformed string;
-`char_to_str` turns an ASCII byte value into a one-character string.
+`char_to_str` turns an ASCII code into a one-character string, and any other
+value into `""`.
 
 ### Integer math
 
@@ -306,7 +310,8 @@ fields   = field ("," field)* ","? ;
 field    = ident ":" type ;
 params   = param ("," param)* ","? ;
 param    = ident ":" type ;
-type     = ident | "[" type "]" | "(" type ("," type)+ ")" ;
+type     = ident | "[" type "]" | "(" types? ")" ;
+types    = type ("," type)* ","? ;
 block    = "{" stmt* expr? "}" ;
 stmt     = "let" "mut"? ident (":" type)? "=" expr ";"
          | "return" expr? ";"
@@ -314,19 +319,23 @@ stmt     = "let" "mut"? ident (":" type)? "=" expr ";"
          | "for" ident "in" expr (".." expr)? block
          | "break" ";"
          | "continue" ";"
-         | expr ";" ;
+         | expr ";"
+         | block | if ;
 expr     = assign ;
 assign   = or (("="|"+="|"-="|"*="|"/="|"%=") assign)? ;
 or       = and ("||" and)* ;
-and      = cmp ("&&" cmp)* ;
-cmp      = add (("=="|"!="|"<"|"<="|">"|">=") add)* ;
+and      = eq ("&&" eq)* ;
+eq       = rel (("=="|"!=") rel)* ;
+rel      = add (("<"|"<="|">"|">=") add)* ;
 add      = mul (("+"|"-") mul)* ;
 mul      = unary (("*"|"/"|"%") unary)* ;
 unary    = ("-"|"!") unary | postfix ;
 postfix  = primary ("(" args? ")" | "[" expr "]" | "." ident | "." int)* ;
+args     = expr ("," expr)* ","? ;
 primary  = int | float | string | "true" | "false" | ident
-         | "[" args? "]" | "(" expr ("," expr)* ")" | block | if | match
+         | "[" args? "]" | "(" args? ")" | block | if | match
          | ident "{" inits? "}" ;
+inits    = ident ":" expr ("," ident ":" expr)* ","? ;
 if       = "if" expr block ("else" (if | block))? ;
 match    = "match" expr "{" (pattern "=>" expr ","?)* "}" ;
 pattern  = int | "-" int | "true" | "false" | "_" ;

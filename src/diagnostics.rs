@@ -1,27 +1,23 @@
-//! The diagnostics subsystem: a phase-independent model for errors and
-//! warnings, plus rendering on top of [`miette`].
+//! Diagnostics: the error and warning model shared by every phase, rendered
+//! with [`miette`].
 //!
-//! Diagnostics are first-class. Every phase builds [`Diagnostic`] values and
-//! pushes them into a shared [`Diagnostics`] sink rather than returning `Err`
-//! eagerly, which lets phases report *many* problems from one run instead of
-//! stopping at the first. Construction is infallible and never panics.
-//!
-//! Rendering is deterministic (no colour, fixed Unicode theme) so that snapshot
-//! tests over diagnostic output are stable.
+//! Phases push [`Diagnostic`]s into a shared [`Diagnostics`] sink instead of
+//! returning early, so one run reports every problem it can find. Rendering
+//! uses a fixed, colourless theme so output is stable for tests.
 
 use crate::errors::DiagCode;
 use crate::source::SourceFile;
 use crate::span::Span;
 
-/// Whether a diagnostic blocks compilation (`Error`) or is advisory (`Warning`).
+/// Whether a diagnostic stops compilation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
     Warning,
 }
 
-/// A span annotated with a message. The `primary` label points at the root of
-/// the problem; secondary labels add supporting context elsewhere in the source.
+/// A message attached to a span. The primary label marks the problem;
+/// secondary labels point at related code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Label {
     pub span: Span,
@@ -29,10 +25,8 @@ pub struct Label {
     pub primary: bool,
 }
 
-/// A single error or warning, with optional labels, notes, and help text.
-///
-/// Build one with [`Diagnostic::error`] / [`Diagnostic::warning`] and the
-/// `with_*` chaining methods.
+/// One error or warning. Build it with [`Diagnostic::error`] or
+/// [`Diagnostic::warning`] and the `with_*` methods.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub severity: Severity,
@@ -44,65 +38,60 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    /// Starts an error diagnostic with the given code and headline message.
+    /// Starts an error with a headline `message`.
     pub fn error(code: DiagCode, message: impl Into<String>) -> Diagnostic {
-        Diagnostic {
-            severity: Severity::Error,
-            code,
-            message: message.into(),
-            labels: Vec::new(),
-            notes: Vec::new(),
-            helps: Vec::new(),
-        }
+        Diagnostic::new(Severity::Error, code, message.into())
     }
 
-    /// Starts a warning diagnostic with the given code and headline message.
+    /// Starts a warning with a headline `message`.
     pub fn warning(code: DiagCode, message: impl Into<String>) -> Diagnostic {
+        Diagnostic::new(Severity::Warning, code, message.into())
+    }
+
+    fn new(severity: Severity, code: DiagCode, message: String) -> Diagnostic {
         Diagnostic {
-            severity: Severity::Warning,
+            severity,
             code,
-            message: message.into(),
+            message,
             labels: Vec::new(),
             notes: Vec::new(),
             helps: Vec::new(),
         }
     }
 
-    /// Adds the primary label, which carries the caret underline in rendered
-    /// output. A diagnostic should have exactly one.
-    pub fn with_primary(mut self, span: Span, message: impl Into<String>) -> Diagnostic {
+    /// Adds the primary label, drawn as the underline at the problem.
+    pub fn with_primary(self, span: Span, message: impl Into<String>) -> Diagnostic {
+        self.push_label(span, message.into(), true)
+    }
+
+    /// Adds a secondary label pointing at related code.
+    pub fn with_label(self, span: Span, message: impl Into<String>) -> Diagnostic {
+        self.push_label(span, message.into(), false)
+    }
+
+    fn push_label(mut self, span: Span, message: String, primary: bool) -> Diagnostic {
         self.labels.push(Label {
             span,
-            message: message.into(),
-            primary: true,
+            message,
+            primary,
         });
         self
     }
 
-    /// Adds a secondary label providing extra context at another location.
-    pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Diagnostic {
-        self.labels.push(Label {
-            span,
-            message: message.into(),
-            primary: false,
-        });
-        self
-    }
-
-    /// Adds a free-standing note (rendered after the snippet).
+    /// Adds a note, rendered after the snippet as `note: …`.
     pub fn with_note(mut self, note: impl Into<String>) -> Diagnostic {
         self.notes.push(note.into());
         self
     }
 
-    /// Adds an actionable help line suggesting how to fix the problem.
+    /// Adds a help line suggesting a fix.
     pub fn with_help(mut self, help: impl Into<String>) -> Diagnostic {
         self.helps.push(help.into());
         self
     }
 
-    /// The primary span, if any, else the first label's span, else `DUMMY`.
-    /// Useful for sorting diagnostics by source order.
+    /// The primary label's span, else the first label's, else
+    /// [`Span::DUMMY`]. Used to sort diagnostics into source order.
     pub fn primary_span(&self) -> Span {
         self.labels
             .iter()
@@ -112,22 +101,20 @@ impl Diagnostic {
             .unwrap_or(Span::DUMMY)
     }
 
-    /// Renders this diagnostic against `file` to a plain (uncoloured) string.
+    /// Renders against `file` as plain, uncoloured text.
     pub fn render(&self, file: &SourceFile) -> String {
         let adapter = Adapter::new(self, file);
         let mut out = String::new();
         let handler = miette::GraphicalReportHandler::new()
             .with_theme(miette::GraphicalTheme::unicode_nocolor());
-        // Rendering writes into a String, whose `fmt::Write` is infallible.
+        // Writing into a `String` cannot fail.
         let _ = handler.render_report(&mut out, &adapter);
         out
     }
 }
 
-/// A growable collection of diagnostics shared across phases.
-///
-/// Phases append to it; the driver inspects [`Diagnostics::has_errors`] at each
-/// phase boundary to decide whether to continue.
+/// The sink every phase reports into. The driver checks
+/// [`Diagnostics::has_errors`] between phases.
 #[derive(Debug, Default)]
 pub struct Diagnostics {
     items: Vec<Diagnostic>,
@@ -141,7 +128,7 @@ impl Diagnostics {
         Diagnostics::default()
     }
 
-    /// Records a diagnostic, updating the error/warning tallies.
+    /// Records a diagnostic.
     pub fn emit(&mut self, diag: Diagnostic) {
         match diag.severity {
             Severity::Error => self.errors += 1,
@@ -150,35 +137,33 @@ impl Diagnostics {
         self.items.push(diag);
     }
 
-    /// Number of errors recorded so far.
+    /// Number of errors recorded.
     pub fn error_count(&self) -> usize {
         self.errors
     }
 
-    /// Number of warnings recorded so far.
+    /// Number of warnings recorded.
     pub fn warning_count(&self) -> usize {
         self.warnings
     }
 
-    /// Whether any error has been recorded.
+    /// Whether any error was recorded.
     pub fn has_errors(&self) -> bool {
         self.errors > 0
     }
 
-    /// Whether nothing has been recorded at all.
+    /// Whether nothing was recorded.
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
-    /// All recorded diagnostics, in emission order.
+    /// Every diagnostic, in emission order.
     pub fn items(&self) -> &[Diagnostic] {
         &self.items
     }
 
-    /// Renders every diagnostic in source order, separated by blank lines.
-    ///
-    /// Sorting by primary span gives stable, reading-order output regardless of
-    /// the order phases happened to emit problems in.
+    /// Renders every diagnostic in source order (by primary span; ties keep
+    /// emission order), each followed by a blank line.
     pub fn render_all(&self, file: &SourceFile) -> String {
         let mut order: Vec<&Diagnostic> = self.items.iter().collect();
         order.sort_by_key(|d| d.primary_span().lo);
@@ -191,10 +176,8 @@ impl Diagnostics {
     }
 }
 
-/// Bridges a [`Diagnostic`] to the [`miette::Diagnostic`] trait for rendering.
-///
-/// Kept private: the rest of the compiler never depends on miette directly,
-/// so the diagnostic model and its presentation stay decoupled.
+/// Adapts a [`Diagnostic`] to [`miette::Diagnostic`]. Private, so nothing else
+/// depends on miette.
 #[derive(Debug)]
 struct Adapter {
     severity: Severity,
@@ -220,8 +203,8 @@ impl Adapter {
             })
             .collect();
 
-        // miette exposes a single help/footer block; fold notes and helps into
-        // it, tagging notes so they remain distinguishable from suggestions.
+        // miette has a single help block, so notes and helps share it; notes
+        // get a `note:` prefix to tell them apart.
         let mut footer = Vec::new();
         footer.extend(diag.notes.iter().map(|n| format!("note: {n}")));
         footer.extend(diag.helps.iter().cloned());

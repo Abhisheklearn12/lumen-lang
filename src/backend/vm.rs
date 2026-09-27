@@ -1,31 +1,23 @@
-//! The virtual machine: a stack-based interpreter for [`Program`] bytecode.
+//! The virtual machine: a stack interpreter for [`Program`] bytecode.
 //!
-//! # Model
+//! All calls share one [`Value`] stack. A call's locals, parameters first,
+//! occupy `stack[base .. base + n_locals]`: the caller's pushed arguments
+//! become the parameters, and the other slots start as `unit`. `Return` drops
+//! the callee's slots and leaves its result for the caller.
 //!
-//! One operand [`Value`] stack is shared across calls. Each active call owns a
-//! [`Frame`] recording its function, instruction pointer, and `base`  the
-//! stack index of its first local. Locals (parameters first) live at
-//! `stack[base .. base + n_locals]`; arguments pushed by the caller *become*
-//! the leading locals, and the remaining slots are reserved with `unit` on
-//! entry. A `Return` discards the callee's slots and leaves the single return
-//! value for the caller, preserving the same stack discipline the code
-//! generator emits.
-//!
-//! # Robustness
-//!
-//! The VM never panics. Genuine program errors (division by zero, integer
-//! overflow) become a [`VmError`]; situations that the type checker and code
-//! generator make impossible are still handled defensively as
-//! [`VmError::Internal`] rather than with `unwrap`. A step limit bounds
-//! execution so a runaway loop fails cleanly instead of hanging.
-//!
-//! Output from `print_*` builtins is captured into a string so execution is
-//! deterministic and testable; the driver prints it.
+//! Program faults (division by zero, a bad index, ...) are [`VmError`]s, and
+//! states the compiler rules out are [`VmError::Internal`], never panics. A
+//! step limit stops runaway loops. Printed output is collected in a string,
+//! which the driver prints.
 
-use crate::backend::bytecode::{Op, Program, Value};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::backend::builtins;
+use crate::backend::bytecode::{Array, Op, Program, Value};
 use crate::sema::types::Builtin;
 
-/// A recoverable runtime error.
+/// A runtime error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VmError {
     #[error("division by zero")]
@@ -40,42 +32,39 @@ pub enum VmError {
     ArrayTooLong { len: i64, max: i64 },
     #[error("execution exceeded the step limit ({0} steps)")]
     StepLimitExceeded(u64),
-    /// An invariant the front-end should guarantee was violated. Indicates a
-    /// compiler bug, surfaced rather than panicked on.
+    /// A state the compiler should rule out: a compiler bug, or unverified
+    /// bytecode.
     #[error("internal VM error: {0}")]
     Internal(&'static str),
 }
 
-/// The result of running a program: its final value and captured output.
+/// A finished run.
 #[derive(Debug, Clone)]
 pub struct Execution {
-    /// The value `main` returned (always `unit` for a valid program).
+    /// What `main` returned: `unit` for a valid program.
     pub value: Value,
-    /// Everything written by `print_*` builtins, in order.
+    /// Everything the `print_*` builtins wrote.
     pub stdout: String,
 }
 
-/// Default step budget  generous for real programs, bounded enough that a
-/// runaway loop in a test fails fast.
+/// The default step budget: ample for real programs, small enough that a
+/// runaway loop fails fast.
 pub const DEFAULT_STEP_LIMIT: u64 = 50_000_000;
 
-/// Largest array a program may allocate at runtime.
+/// The longest array a program may allocate.
 ///
-/// The step budget bounds runaway *execution*; this bounds runaway
-/// *allocation*, and for the same reason: without it, `array_new_int` of a
-/// huge length asks the allocator for terabytes and the process aborts, which
-/// is neither a [`VmError`] nor something a program can recover from. A fixed
-/// limit also keeps the outcome identical on every machine, rather than
-/// depending on how much memory happens to be free.
+/// Without it, `array_new_int` of a huge length would make the allocator abort
+/// the process instead of failing with a [`VmError`]. A fixed limit also gives
+/// the same result on every machine, whatever memory is free.
 pub const MAX_ARRAY_LEN: i64 = 1 << 24;
 
-/// Executes `program` from its entry point with the default step limit.
+/// Runs `program` from `main` with the default step limit.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn execute(program: &Program) -> Result<Execution, VmError> {
     execute_with_limit(program, DEFAULT_STEP_LIMIT)
 }
 
-/// Executes `program`, failing with [`VmError::StepLimitExceeded`] after
+/// Runs `program`, failing with [`VmError::StepLimitExceeded`] after
 /// `max_steps` instructions.
 pub fn execute_with_limit(program: &Program, max_steps: u64) -> Result<Execution, VmError> {
     let mut vm = Vm {
@@ -91,10 +80,11 @@ pub fn execute_with_limit(program: &Program, max_steps: u64) -> Result<Execution
     })
 }
 
-/// A call frame.
+/// An active call.
 struct Frame {
     func: usize,
     ip: usize,
+    /// The stack index of local 0.
     base: usize,
 }
 
@@ -119,8 +109,7 @@ impl Vm<'_> {
             let func = frame.func;
             let ip = frame.ip;
             let chunk = &self.program.functions[func];
-            // A well-formed chunk always ends in `Return`, so running off the
-            // end is an internal error rather than an implicit return.
+            // Well-formed code never runs past its last `Return`.
             let op = chunk
                 .code
                 .get(ip)
@@ -129,15 +118,14 @@ impl Vm<'_> {
             self.top_mut()?.ip += 1;
 
             if let Some(value) = self.step(op)? {
-                // `step` returns `Some` only when the outermost frame returned.
                 return Ok(value);
             }
         }
         Ok(Value::Unit)
     }
 
-    /// Executes one instruction. Returns `Some(value)` exactly when the program
-    /// has finished (the entry frame returned).
+    /// Executes one instruction. Returns `Some` with `main`'s result once
+    /// `main` returns.
     fn step(&mut self, op: Op) -> Result<Option<Value>, VmError> {
         match op {
             Op::PushInt(v) => self.push(Value::Int(v)),
@@ -224,15 +212,13 @@ impl Vm<'_> {
                     .stack
                     .len()
                     .checked_sub(n as usize)
-                    .ok_or(stack_underflow())?;
+                    .ok_or(VmError::Internal("stack underflow"))?;
                 let items: Vec<Value> = self.stack.split_off(at);
-                self.push(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
-                    items,
-                ))));
+                self.push(Value::Array(Rc::new(RefCell::new(items))));
             }
             Op::NewArray(elem) => {
                 let len = self.pop_int()?;
-                self.push(crate::backend::builtins::new_array(elem, len)?);
+                self.push(builtins::new_array(elem, len)?);
             }
             Op::Index => {
                 let idx = self.pop_int()?;
@@ -278,8 +264,7 @@ impl Vm<'_> {
         Ok(None)
     }
 
-    /// Sets up a new call frame for `func`, consuming `argc` arguments already
-    /// on the stack as the leading locals.
+    /// Enters `func`, whose parameters are the top `argc` stack values.
     fn enter(&mut self, func: usize, argc: usize) -> Result<(), VmError> {
         let chunk = self
             .program
@@ -290,7 +275,7 @@ impl Vm<'_> {
             return Err(VmError::Internal("not enough arguments on stack"));
         }
         let base = self.stack.len() - argc;
-        // Reserve the non-parameter local slots.
+        // The other locals start as `unit`.
         for _ in argc..chunk.n_locals {
             self.stack.push(Value::Unit);
         }
@@ -298,8 +283,8 @@ impl Vm<'_> {
         Ok(())
     }
 
-    /// Returns from the current function, discarding its slots and leaving the
-    /// return value for the caller. Yields `Some` when the entry frame returns.
+    /// Returns from the current call, leaving the result for the caller.
+    /// Yields `Some(result)` when `main` returns.
     fn ret(&mut self) -> Result<Option<Value>, VmError> {
         let value = self.pop()?;
         let frame = self
@@ -315,23 +300,20 @@ impl Vm<'_> {
     }
 
     fn call_builtin(&mut self, builtin: Builtin, argc: usize) -> Result<(), VmError> {
-        // Pop arguments (they were pushed left-to-right, so the last is on top).
+        // The last argument is on top.
         let mut args = Vec::with_capacity(argc);
         for _ in 0..argc {
             args.push(self.pop()?);
         }
         args.reverse();
-        // Builtins are evaluated by the shared module so both execution engines
-        // agree on their behaviour.
-        let result = crate::backend::builtins::eval(builtin, &args, &mut self.stdout)?;
+        let result = builtins::eval(builtin, &args, &mut self.stdout)?;
         self.push(result);
         Ok(())
     }
 
     // ---- frame & stack helpers ----
 
-    /// The active call frame. The run loop only steps while a frame exists, so
-    /// this is `Err` only on a compiler bug, surfaced rather than panicked on.
+    /// The current call. The run loop steps only while one exists.
     fn top(&self) -> Result<&Frame, VmError> {
         self.frames
             .last()
@@ -366,14 +348,14 @@ impl Vm<'_> {
         }
     }
 
-    fn pop_str(&mut self) -> Result<std::rc::Rc<str>, VmError> {
+    fn pop_str(&mut self) -> Result<Rc<str>, VmError> {
         match self.pop()? {
             Value::Str(v) => Ok(v),
             _ => Err(VmError::Internal("expected str")),
         }
     }
 
-    fn pop_array(&mut self) -> Result<crate::backend::bytecode::Array, VmError> {
+    fn pop_array(&mut self) -> Result<Array, VmError> {
         match self.pop()? {
             Value::Array(a) => Ok(a),
             _ => Err(VmError::Internal("expected array")),
@@ -416,8 +398,7 @@ impl Vm<'_> {
     }
 }
 
-/// Converts a signed index to an in-bounds `usize`, or `None` if out of range
-/// (negative or `>= len`). Shared with the builtin evaluator.
+/// `index` as a `usize`, if it is in `0..len`.
 pub(crate) fn index_in_bounds(index: i64, len: usize) -> Option<usize> {
     if index < 0 {
         return None;
@@ -426,11 +407,8 @@ pub(crate) fn index_in_bounds(index: i64, len: usize) -> Option<usize> {
     (i < len).then_some(i)
 }
 
-fn stack_underflow() -> VmError {
-    VmError::Internal("stack underflow")
-}
-
-fn checked_div(a: i64, b: i64) -> Result<i64, VmError> {
+/// `a / b`, failing on a zero divisor or overflow (`i64::MIN / -1`).
+pub(crate) fn checked_div(a: i64, b: i64) -> Result<i64, VmError> {
     if b == 0 {
         Err(VmError::DivisionByZero)
     } else {
@@ -438,7 +416,8 @@ fn checked_div(a: i64, b: i64) -> Result<i64, VmError> {
     }
 }
 
-fn checked_rem(a: i64, b: i64) -> Result<i64, VmError> {
+/// `a % b`, failing on a zero divisor or overflow (`i64::MIN % -1`).
+pub(crate) fn checked_rem(a: i64, b: i64) -> Result<i64, VmError> {
     if b == 0 {
         Err(VmError::DivisionByZero)
     } else {
