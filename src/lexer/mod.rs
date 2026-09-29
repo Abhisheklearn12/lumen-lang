@@ -1,25 +1,12 @@
-//! The lexer: turns source text into a flat [`Token`] stream.
+//! The lexer: source text to a flat [`Token`] stream.
 //!
-//! # Design
+//! A hand-written, single-pass scanner with at most two characters of
+//! lookahead, linear in the input.
 //!
-//! The scanner is a hand-written, single-pass cursor over the source string. It
-//! is deliberately not table- or regex-driven: the token grammar is small, and
-//! explicit `match` arms are easier to read, debug, and attribute spans to than
-//! a generated automaton.
-//!
-//! # Error recovery
-//!
-//! Lexing never aborts. On a malformed token (stray character, unterminated
-//! string, bad number) it emits a [`Diagnostic`] and resynchronises  skipping
-//! the offending character or taking a best-effort value  so that a single
-//! typo does not hide every later token. The returned stream is therefore
-//! always well-formed and always ends in [`TokenKind::Eof`], which frees the
-//! parser from having to handle lexical errors.
-//!
-//! # Complexity
-//!
-//! `O(n)` in the length of the source; each byte is visited a constant number
-//! of times. No backtracking.
+//! Lexing never stops at an error. A malformed token gets a [`Diagnostic`] and
+//! a best-effort result (a stray character is skipped, a bad number becomes
+//! `0`, an unterminated string keeps what it has), so one typo does not hide
+//! later tokens. The stream always ends in [`TokenKind::Eof`].
 
 mod token;
 
@@ -30,10 +17,8 @@ use crate::errors::DiagCode;
 use crate::source::SourceFile;
 use crate::span::Span;
 
-/// Tokenises `file`, reporting any lexical errors into `diags`.
-///
-/// The returned vector always ends with an [`TokenKind::Eof`] token whose span
-/// is the empty range at end-of-input, giving the parser a stable sentinel.
+/// Tokenises `file`, reporting lexical errors to `diags`. The result ends with
+/// an [`TokenKind::Eof`] whose span is empty and at the end of the input.
 #[tracing::instrument(level = "debug", skip_all, fields(file = file.name()))]
 pub fn tokenize(file: &SourceFile, diags: &mut Diagnostics) -> Vec<Token> {
     let tokens = Lexer::new(file.text(), diags).run();
@@ -41,10 +26,9 @@ pub fn tokenize(file: &SourceFile, diags: &mut Diagnostics) -> Vec<Token> {
     tokens
 }
 
-/// Internal scanning state. Not exposed; callers use [`tokenize`].
 struct Lexer<'a> {
     src: &'a str,
-    /// Current byte offset into `src`. Always on a UTF-8 char boundary.
+    /// Byte offset into `src`; always on a `char` boundary.
     pos: usize,
     diags: &'a mut Diagnostics,
 }
@@ -72,26 +56,26 @@ impl<'a> Lexer<'a> {
 
     // ---- cursor primitives ----
 
-    /// The current character without advancing.
+    /// The current character.
     fn peek(&self) -> Option<char> {
         self.src[self.pos..].chars().next()
     }
 
-    /// The character one position ahead of the cursor.
+    /// The character after the current one.
     fn peek2(&self) -> Option<char> {
         let mut chars = self.src[self.pos..].chars();
         chars.next();
         chars.next()
     }
 
-    /// Advances past and returns the current character.
+    /// Consumes and returns the current character.
     fn bump(&mut self) -> Option<char> {
         let ch = self.peek()?;
         self.pos += ch.len_utf8();
         Some(ch)
     }
 
-    /// Advances if the current character equals `expected`.
+    /// Consumes the current character if it is `expected`.
     fn eat(&mut self, expected: char) -> bool {
         if self.peek() == Some(expected) {
             self.pos += expected.len_utf8();
@@ -107,7 +91,7 @@ impl<'a> Lexer<'a> {
 
     // ---- trivia ----
 
-    /// Skips whitespace and both comment forms, looping until real input.
+    /// Skips whitespace and comments.
     fn skip_trivia(&mut self) {
         loop {
             match self.peek() {
@@ -130,8 +114,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Skips a `/* ... */` comment, supporting nesting. Reports an unterminated
-    /// comment if EOF is reached before the nesting returns to zero.
+    /// Skips a `/* ... */` comment, which may nest, reporting it if unterminated.
     fn skip_block_comment(&mut self) {
         let start = self.pos;
         self.bump(); // '/'
@@ -165,10 +148,8 @@ impl<'a> Lexer<'a> {
 
     // ---- token dispatch ----
 
-    /// Scans one token starting at `start` whose first char is `ch`.
-    ///
-    /// Returns `None` only when the input was an unrecoverable single character
-    /// (already reported) that produces no token.
+    /// Scans the token starting with `ch` at `start`. `None` means `ch` begins
+    /// no token; it has been reported and skipped.
     fn scan_token(&mut self, ch: char, start: usize) -> Option<Token> {
         if ch.is_ascii_digit() {
             return Some(self.scan_number(start));
@@ -182,7 +163,8 @@ impl<'a> Lexer<'a> {
         self.scan_symbol(ch, start)
     }
 
-    /// Scans punctuation/operators, choosing the longest match (`==` over `=`).
+    /// Scans an operator or punctuation, preferring the longest match (`==`
+    /// over `=`).
     fn scan_symbol(&mut self, ch: char, start: usize) -> Option<Token> {
         self.bump();
         let kind = match ch {
@@ -238,8 +220,7 @@ impl<'a> Lexer<'a> {
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
             self.bump();
         }
-        // A float requires a `.` *followed by* a digit, so `1.method` (none yet,
-        // but future-proof) and `1..2` would not be misread as floats.
+        // A float needs a digit after the `.`, so `1..2` is a range, not `1.`.
         let is_float = self.peek() == Some('.') && self.peek2().is_some_and(|c| c.is_ascii_digit());
         if is_float {
             self.bump(); // '.'
@@ -263,8 +244,7 @@ impl<'a> Lexer<'a> {
         Token::new(kind, span)
     }
 
-    /// Reports an unparseable numeric literal and substitutes a zero so that
-    /// later phases can proceed.
+    /// Reports a literal that does not fit its type and substitutes `0`.
     fn bad_number(&mut self, text: &str, span: Span) -> TokenKind {
         self.diags.emit(
             Diagnostic::error(
@@ -288,18 +268,16 @@ impl<'a> Lexer<'a> {
         Token::new(kind, span)
     }
 
-    /// Scans a double-quoted string literal, resolving escape sequences.
-    ///
-    /// On an unterminated string the partial value is returned with a
-    /// diagnostic; on an unknown escape the backslash sequence is kept verbatim
-    /// and a diagnostic is emitted. Either way a usable token is produced.
+    /// Scans a double-quoted string, resolving escapes. An unterminated string
+    /// keeps what was read; an unknown escape `\x` keeps `x`. Both are
+    /// reported.
     fn scan_string(&mut self, start: usize) -> Token {
         self.bump(); // opening quote
         let mut value = String::new();
         loop {
             match self.bump() {
                 Some('"') => break,
-                Some('\\') => self.scan_escape(&mut value, start),
+                Some('\\') => self.scan_escape(&mut value),
                 Some(c) => value.push(c),
                 None => {
                     self.diags.emit(
@@ -317,8 +295,8 @@ impl<'a> Lexer<'a> {
         Token::new(TokenKind::Str(value), self.span_from(start))
     }
 
-    /// Handles the character following a backslash inside a string.
-    fn scan_escape(&mut self, value: &mut String, str_start: usize) {
+    /// Scans the character after a backslash in a string.
+    fn scan_escape(&mut self, value: &mut String) {
         let esc_start = self.pos - 1;
         match self.bump() {
             Some('n') => value.push('\n'),
@@ -338,11 +316,8 @@ impl<'a> Lexer<'a> {
                     .with_help("valid escapes are \\n \\t \\r \\0 \\\\ \\\""),
                 );
             }
-            None => {
-                // Backslash immediately before EOF: the unterminated-string path
-                // in `scan_string` will report the missing quote.
-                let _ = str_start;
-            }
+            // A backslash at EOF: `scan_string` reports the missing quote.
+            None => {}
         }
     }
 }

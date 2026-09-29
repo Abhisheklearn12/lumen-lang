@@ -1,15 +1,11 @@
-//! A deterministic pretty-printer for the [`Hir`].
-//!
-//! Like the AST printer, this renders a stable, indented tree for snapshot
-//! tests and `lumenc --dump hir`. Because HIR is fully typed, each expression
-//! line ends with its type in `: ty` form, and variables appear as their
-//! [`LocalId`] slot alongside the declared name, making lowering decisions
-//! (slot allocation, call targets) visible at a glance.
+//! The HIR printer behind `lumenc dump hir`: one node per line, indented by
+//! depth, with each expression's type after a `:`. Locals print as their
+//! [`LocalId`] slot (`_3`), so slot allocation is visible.
 
 use crate::hir::*;
 use crate::sema::types::Builtin;
 
-/// Renders a whole program to a string.
+/// Renders a whole program.
 pub fn print_hir(hir: &Hir) -> String {
     let mut p = Printer {
         out: String::new(),
@@ -55,7 +51,7 @@ impl Printer {
             func.name, params, func.ret, entry
         ));
         self.indented(|p| {
-            // Show the non-parameter locals so slot numbering is explicit.
+            // Parameters are in the header; list the other slots.
             for (i, local) in func.locals.iter().enumerate().skip(func.param_count) {
                 p.line(&format!("local {}: {} {}", i, local.name, local.ty));
             }

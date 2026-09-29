@@ -1,21 +1,12 @@
-//! Lowering: AST + [`Resolution`] + [`Typeck`] → [`Hir`].
+//! Lowering: AST, [`Resolution`], and [`Typeck`] to [`Hir`].
 //!
-//! # Precondition
+//! It runs only on programs that type-checked, so it reports nothing. Where
+//! malformed input could still reach a case (a name that is not a local, say),
+//! it substitutes a harmless placeholder instead of panicking.
 //!
-//! Lowering assumes the program is **well-typed**: the driver only calls it
-//! after resolution and type checking have produced no errors. It therefore
-//! emits no diagnostics. Where a malformed program could in principle reach a
-//! branch (e.g. a name that did not resolve to a local), lowering substitutes a
-//! harmless placeholder rather than panicking, keeping the rule that the
-//! compiler never crashes on bad input.
-//!
-//! # What it does
-//!
-//! For each function it allocates a dense [`LocalId`] for every parameter and
-//! `let` binding (parameters first), recording the mapping from the AST's
-//! definition [`NodeId`]s. It then walks the body, replacing names with local
-//! reads, call targets with [`Callee`]s, and attaching the type computed by the
-//! checker to every node.
+//! Each function's parameters and bindings get dense [`LocalId`]s, parameters
+//! first. Names become local reads or inlined constants, calls name their
+//! [`Callee`], and every node takes the type the checker gave it.
 
 use std::collections::HashMap;
 
@@ -26,7 +17,7 @@ use crate::sema::resolve::{Res, Resolution, StructId};
 use crate::sema::typeck::{ConstValue, Typeck};
 use crate::sema::types::Type;
 
-/// Builds the HIR literal kind for an inlined constant value.
+/// The literal an inlined constant becomes.
 fn const_value_kind(value: &ConstValue) -> ExprKind {
     match value {
         ConstValue::Int(v) => ExprKind::Int(*v),
@@ -52,8 +43,7 @@ pub fn lower(ast: &ast::Ast, res: &Resolution, tc: &Typeck) -> Hir {
         };
         functions.push(lowerer.lower_fn(fn_id, decl));
     }
-    // `main` is guaranteed present in a well-typed program; fall back to the
-    // first function only if the precondition was violated.
+    // A well-typed program has a `main`.
     let main = tc.main.unwrap_or(FnId(0));
     tracing::debug!(functions = functions.len(), "lowering complete");
     Hir { functions, main }
@@ -62,9 +52,9 @@ pub fn lower(ast: &ast::Ast, res: &Resolution, tc: &Typeck) -> Hir {
 struct Lowerer<'a> {
     res: &'a Resolution,
     tc: &'a Typeck,
-    /// Locals of the function currently being lowered.
+    /// The current function's locals.
     locals: Vec<LocalDecl>,
-    /// Definition `NodeId` → its allocated [`LocalId`], for the current function.
+    /// Definition → slot, for the current function.
     local_map: HashMap<NodeId, LocalId>,
 }
 
@@ -99,7 +89,6 @@ impl Lowerer<'_> {
     fn lower_stmt(&mut self, stmt: &ast::Stmt) -> Stmt {
         match &stmt.kind {
             ast::StmtKind::Let(l) => {
-                // Lower the initialiser first; the binding is not in scope for it.
                 let value = self.lower_expr(&l.init);
                 let local = self.alloc_local(l.id, &l.name.name, self.tc.local_type(l.id));
                 Stmt::Let { local, value }
@@ -111,8 +100,6 @@ impl Lowerer<'_> {
                 body: self.lower_block(&w.body),
             },
             ast::StmtKind::For(f) => {
-                // Bounds are evaluated in the outer scope; then the loop variable
-                // and a hidden slot caching the upper bound get their own slots.
                 let start = self.lower_expr(&f.start);
                 let end = self.lower_expr(&f.end);
                 let var = self.alloc_local(f.id, &f.var.name, Type::Int);
@@ -132,35 +119,32 @@ impl Lowerer<'_> {
         }
     }
 
-    /// Desugars `for v in arr { body }` into an index-based loop:
+    /// Desugars `for v in arr { body }` to an index loop over the array,
+    /// evaluated once:
     ///
     /// ```text
     /// {
-    ///     let <arr> = arr;          // evaluate the array exactly once
+    ///     let <arr> = arr;
     ///     for <i> in 0..len(<arr>) {
-    ///         let v = <arr>[<i>];   // bind the element at the loop top
+    ///         let v = <arr>[<i>];
     ///         body
     ///     }
     /// }
     /// ```
-    ///
-    /// Reusing the [`Stmt::For`] node (rather than a `while`) keeps `continue`
-    /// routed to the index increment, so the loop cannot spin forever.
     fn lower_for_each(&mut self, f: &ast::ForEachStmt, span: Span) -> Stmt {
         let iterable = self.lower_expr(&f.iterable);
         let elem_ty = match iterable.ty {
             Type::Array(elem) => elem.ty(),
             _ => Type::Error,
         };
-        // Hidden slots: the cached array, the index, and the cached length.
+        // Hidden slots: the array, the index, and the length.
         let arr_local = self.alloc_synthetic("<foreach-arr>", iterable.ty);
         let idx = self.alloc_synthetic("<foreach-idx>", Type::Int);
         let end_var = self.alloc_synthetic("<for-end>", Type::Int);
-        // The user-visible element binding must exist before lowering the body.
+        // The body refers to `v`, so allocate it first.
         let var = self.alloc_local(f.id, &f.var.name, elem_ty);
 
         let mut body = self.lower_block(&f.body);
-        // Prepend `let v = <arr>[<i>];` to the loop body.
         let read = Stmt::Let {
             local: var,
             value: Expr::new(
@@ -193,7 +177,6 @@ impl Lowerer<'_> {
             local: arr_local,
             value: iterable,
         };
-        // Wrap the array binding and the loop in a unit-typed block statement.
         Stmt::Expr(Expr::new(
             ExprKind::Block(Block {
                 stmts: vec![let_arr, for_stmt],
@@ -238,7 +221,7 @@ impl Lowerer<'_> {
                     idx,
                 }
             }
-            // Tuples share the struct/array runtime representation.
+            // A tuple is a struct with numbered fields.
             ast::ExprKind::TupleLit(elems) => {
                 ExprKind::StructLit(elems.iter().map(|e| self.lower_expr(e)).collect())
             }
@@ -264,24 +247,21 @@ impl Lowerer<'_> {
         Expr::new(kind, ty, expr.span)
     }
 
-    /// Desugars `match scrutinee { pat => body, ... }` into a binding for the
-    /// scrutinee followed by a chain of `if`/`else`:
+    /// Desugars `match` to an `if` chain on the scrutinee, evaluated once:
     ///
     /// ```text
     /// { let <m> = scrutinee;
     ///   if <m> == p0 { b0 } else if <m> == p1 { b1 } else { default } }
     /// ```
     ///
-    /// The default is the wildcard arm's body, or, for an exhaustive match with
-    /// no wildcard (a `bool` covering both values), the final arm unconditionally
-    /// (its condition is then redundant, so it is dropped). Type checking has
-    /// already proven the match exhaustive, so a missing default is unreachable.
+    /// `default` is the first `_` arm's body; arms after it are unreachable
+    /// and dropped. Without `_`, the match is a `bool` match covering both
+    /// values, and the last arm becomes the default.
     fn lower_match(&mut self, m: &ast::MatchExpr, ty: Type, span: Span) -> ExprKind {
         let scrut = self.lower_expr(&m.scrutinee);
         let scrut_ty = scrut.ty;
         let tmp = self.alloc_synthetic("<match>", scrut_ty);
 
-        // Split the arms into conditional ones and a single default body.
         let wild = m
             .arms
             .iter()
@@ -294,8 +274,8 @@ impl Lowerer<'_> {
             },
         };
 
-        // Build the chain from the back so each `if` nests inside the previous
-        // arm's `else`.
+        // Build from the last arm back, nesting each `if` in the next one's
+        // `else`.
         let mut else_expr: Option<Box<Expr>> = default.map(|b| Box::new(self.lower_expr(b)));
         for arm in cond_arms.iter().rev() {
             let body = self.lower_expr(&arm.body);
@@ -326,8 +306,7 @@ impl Lowerer<'_> {
             else_expr = Some(Box::new(if_expr));
         }
 
-        // The scrutinee is bound first so it is evaluated exactly once. An empty
-        // match (no arms) is rejected by the checker; lower a unit placeholder.
+        // A match with no arms fails type checking; lower it to `unit`.
         let tail = else_expr.unwrap_or_else(|| {
             Box::new(Expr::new(
                 ExprKind::Block(Block {
@@ -349,24 +328,23 @@ impl Lowerer<'_> {
         })
     }
 
-    /// Lowers a match arm's literal pattern to the constant it compares against.
+    /// The literal a pattern compares against.
     fn lower_pattern_literal(&self, pattern: &ast::Pattern, ty: Type, span: Span) -> Expr {
         let kind = match pattern {
             ast::Pattern::Int(v) => ExprKind::Int(*v),
             ast::Pattern::Bool(b) => ExprKind::Bool(*b),
-            // A wildcard never reaches here: it becomes the default, not a test.
+            // Unreachable: `_` becomes the default, never a test.
             ast::Pattern::Wild => ExprKind::Bool(true),
         };
         Expr::new(kind, ty, span)
     }
 
-    /// Lowers a name in value position: a local read, or an inlined constant.
+    /// Lowers a name used as a value: a local read or an inlined constant.
     fn lower_name(&self, use_id: NodeId) -> ExprKind {
         match self.res.use_of(use_id) {
             Some(Res::Local(def)) => ExprKind::Local(self.local_of(def)),
-            // Constants are inlined: each use becomes the evaluated literal.
             Some(Res::Const(id)) => const_value_kind(self.tc.const_value(id)),
-            // Unreachable for well-typed input (functions are not values).
+            // Unreachable: functions are not values.
             _ => ExprKind::Int(0),
         }
     }
@@ -375,7 +353,7 @@ impl Lowerer<'_> {
         let target = match self.res.use_of(callee.id) {
             Some(Res::Fn(id)) => Callee::Fn(id),
             Some(Res::Builtin(b)) => Callee::Builtin(b),
-            // Unreachable for well-typed input (no indirect calls).
+            // Unreachable: only names are callable.
             _ => Callee::Fn(FnId(0)),
         };
         let args = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -385,22 +363,19 @@ impl Lowerer<'_> {
         }
     }
 
-    /// Builds a struct literal with field values placed in declaration order.
+    /// Lowers a struct literal with its values in declaration order, which is
+    /// also the order they are evaluated in, whatever order they were written.
     fn lower_struct_lit(&mut self, name: &ast::Ident, fields: &[ast::FieldInit]) -> ExprKind {
-        let order: Vec<String> = match self.res.structs.lookup(&name.name) {
-            Some(id) => self
-                .tc
-                .struct_info(id)
-                .fields
-                .iter()
-                .map(|(n, _)| n.clone())
-                .collect(),
-            None => return ExprKind::Int(0), // unreachable for well-typed input
+        let Some(id) = self.res.structs.lookup(&name.name) else {
+            return ExprKind::Int(0); // unreachable: not a struct
         };
-        let values = order
+        let tc = self.tc;
+        let values = tc
+            .struct_info(id)
+            .fields
             .iter()
             .map(
-                |field_name| match fields.iter().find(|f| &f.name.name == field_name) {
+                |(field_name, _)| match fields.iter().find(|f| &f.name.name == field_name) {
                     Some(fi) => self.lower_expr(&fi.value),
                     None => Expr::new(ExprKind::Int(0), Type::Error, name.span),
                 },
@@ -409,7 +384,7 @@ impl Lowerer<'_> {
         ExprKind::StructLit(values)
     }
 
-    /// The declaration index of `field` on the struct that `base` evaluates to.
+    /// The index of `field` in the struct type of `base`.
     fn field_index(&self, base: &ast::Expr, field: &str) -> u32 {
         match self.tc.type_of(base.id) {
             Type::Struct(sid) => self
@@ -423,52 +398,42 @@ impl Lowerer<'_> {
     }
 
     fn lower_assign(&mut self, target: &ast::Expr, value: &ast::Expr) -> ExprKind {
-        // `a[i] = v` lowers to a SetIndex rather than a local store.
-        if let ast::ExprKind::Index { base, index } = &target.kind {
-            return ExprKind::SetIndex {
+        match &target.kind {
+            ast::ExprKind::Index { base, index } => ExprKind::SetIndex {
                 base: Box::new(self.lower_expr(base)),
                 index: Box::new(self.lower_expr(index)),
                 value: Box::new(self.lower_expr(value)),
-            };
-        }
-        // `s.f = v` lowers to a SetField.
-        if let ast::ExprKind::Field { base, field } = &target.kind {
-            let idx = self.field_index(base, &field.name);
-            return ExprKind::SetField {
-                base: Box::new(self.lower_expr(base)),
-                idx,
+            },
+            ast::ExprKind::Field { base, field } => {
+                let idx = self.field_index(base, &field.name);
+                self.lower_set_field(base, idx, value)
+            }
+            ast::ExprKind::TupleIndex { base, index, .. } => {
+                self.lower_set_field(base, *index as u32, value)
+            }
+            _ => ExprKind::Assign {
+                local: self.target_local(target),
                 value: Box::new(self.lower_expr(value)),
-            };
+            },
         }
-        // `t.0 = v` also lowers to a SetField (tuples reuse the struct runtime).
-        if let ast::ExprKind::TupleIndex { base, index, .. } = &target.kind {
-            return ExprKind::SetField {
-                base: Box::new(self.lower_expr(base)),
-                idx: *index as u32,
-                value: Box::new(self.lower_expr(value)),
-            };
-        }
-        let local = match self.res.use_of(target.id) {
-            Some(Res::Local(def)) => self.local_of(def),
-            _ => LocalId(0),
-        };
-        ExprKind::Assign {
-            local,
+    }
+
+    fn lower_set_field(&mut self, base: &ast::Expr, idx: u32, value: &ast::Expr) -> ExprKind {
+        ExprKind::SetField {
+            base: Box::new(self.lower_expr(base)),
+            idx,
             value: Box::new(self.lower_expr(value)),
         }
     }
 
-    /// Desugars `target op= value` into `target = target op value`.
+    /// Desugars `target op= value` to `target = target op value`.
     fn lower_assign_op(
         &mut self,
         op: ast::BinOp,
         target: &ast::Expr,
         value: &ast::Expr,
     ) -> ExprKind {
-        let local = match self.res.use_of(target.id) {
-            Some(Res::Local(def)) => self.local_of(def),
-            _ => LocalId(0),
-        };
+        let local = self.target_local(target);
         let ty = self.tc.type_of(target.id);
         let lhs = Expr::new(ExprKind::Local(local), ty, target.span);
         let rhs = self.lower_expr(value);
@@ -487,21 +452,16 @@ impl Lowerer<'_> {
         }
     }
 
-    // ---- local slot allocation ----
+    // ---- local slots ----
 
-    /// Allocates the next local slot for a definition node and records it.
+    /// Allocates the next slot for the binding defined by `def`.
     fn alloc_local(&mut self, def: NodeId, name: &str, ty: Type) -> LocalId {
-        let id = LocalId(self.locals.len() as u32);
-        self.locals.push(LocalDecl {
-            name: name.to_string(),
-            ty,
-        });
+        let id = self.alloc_synthetic(name, ty);
         self.local_map.insert(def, id);
         id
     }
 
-    /// Allocates a compiler-internal local slot not tied to any source binding
-    /// (e.g. a `for` loop's cached upper bound).
+    /// Allocates the next slot for a compiler temporary.
     fn alloc_synthetic(&mut self, name: &str, ty: Type) -> LocalId {
         let id = LocalId(self.locals.len() as u32);
         self.locals.push(LocalDecl {
@@ -511,8 +471,16 @@ impl Lowerer<'_> {
         id
     }
 
-    /// The local slot for a definition node, or slot 0 if (impossibly) absent.
+    /// The slot of the binding defined by `def`.
     fn local_of(&self, def: NodeId) -> LocalId {
         self.local_map.get(&def).copied().unwrap_or(LocalId(0))
+    }
+
+    /// The slot an assignment to `target`, a local's name, writes.
+    fn target_local(&self, target: &ast::Expr) -> LocalId {
+        match self.res.use_of(target.id) {
+            Some(Res::Local(def)) => self.local_of(def),
+            _ => LocalId(0),
+        }
     }
 }

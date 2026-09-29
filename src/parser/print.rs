@@ -1,14 +1,9 @@
-//! A deterministic pretty-printer for the [`Ast`].
-//!
-//! Renders the tree as indented, parenthesis-free lines. It exists so the parse
-//! result can be snapshot-tested and inspected via `lumenc --dump ast` without
-//! relying on `derive(Debug)` (which is noisy and embeds spans). Output is
-//! stable across runs: no hashing, no addresses, no spans.
+//! The AST printer behind `lumenc dump ast`: one node per line, indented by
+//! depth. Unlike `Debug`, it omits spans and ids, so output is stable for tests.
 
 use super::ast::*;
-use std::fmt::Write as _;
 
-/// Renders a whole program to a string.
+/// Renders a whole program.
 pub fn print_ast(ast: &Ast) -> String {
     let mut p = Printer {
         out: String::new(),
@@ -26,7 +21,7 @@ struct Printer {
 }
 
 impl Printer {
-    /// Writes one indented line.
+    /// Writes `text` as one line at the current depth.
     fn line(&mut self, text: &str) {
         for _ in 0..self.depth {
             self.out.push_str("  ");
@@ -243,7 +238,7 @@ impl Printer {
                     p.line("scrutinee");
                     p.indented(|p| p.expr(&m.scrutinee));
                     for arm in &m.arms {
-                        p.line(&format!("arm {}", pattern_str(&arm.pattern)));
+                        p.line(&format!("arm {}", arm.pattern));
                         p.indented(|p| p.expr(&arm.body));
                     }
                 });
@@ -253,30 +248,15 @@ impl Printer {
     }
 }
 
-/// Renders a `match` arm pattern to its display form.
-fn pattern_str(pattern: &Pattern) -> String {
-    match pattern {
-        Pattern::Int(v) => v.to_string(),
-        Pattern::Bool(b) => b.to_string(),
-        Pattern::Wild => "_".to_string(),
-    }
-}
-
-/// Renders a syntactic type to its display form.
+/// Renders a type as written, with `<error>` for a malformed one.
 fn type_str(ty: &TypeExpr) -> String {
-    let mut s = String::new();
     match &ty.kind {
-        TypeExprKind::Named(name) => {
-            let _ = write!(s, "{name}");
-        }
-        TypeExprKind::Array(inner) => {
-            let _ = write!(s, "[{}]", type_str(inner));
-        }
+        TypeExprKind::Named(name) => name.clone(),
+        TypeExprKind::Array(inner) => format!("[{}]", type_str(inner)),
         TypeExprKind::Tuple(elems) => {
             let parts = elems.iter().map(type_str).collect::<Vec<_>>().join(", ");
-            let _ = write!(s, "({parts})");
+            format!("({parts})")
         }
-        TypeExprKind::Error => s.push_str("<error>"),
+        TypeExprKind::Error => "<error>".to_string(),
     }
-    s
 }

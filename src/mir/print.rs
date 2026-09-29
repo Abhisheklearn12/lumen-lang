@@ -1,8 +1,5 @@
-//! A deterministic textual dump of [`Program`](super::Program) MIR, for
-//! `lumenc dump mir` and snapshot tests.
-//!
-//! The format is one basic block per labelled section, each instruction on its
-//! own line in `dst = rvalue` form, ending with the block's terminator.
+//! The MIR printer behind `lumenc dump mir`: each block as a labelled list of
+//! instructions ending in its terminator.
 
 use std::fmt::Write as _;
 
@@ -10,7 +7,7 @@ use crate::hir::Callee;
 use crate::mir::*;
 use crate::sema::types::Builtin;
 
-/// Renders a whole MIR program to a string.
+/// Renders a whole program.
 pub fn print_mir(program: &Program) -> String {
     let mut out = String::new();
     for (i, func) in program.functions.iter().enumerate() {
@@ -47,7 +44,7 @@ fn print_function(out: &mut String, func: &Function) {
     out.push_str("}\n");
 }
 
-fn inst_str(inst: &Inst) -> String {
+pub(super) fn inst_str(inst: &Inst) -> String {
     match inst {
         Inst::Assign { dst, rvalue } => format!("{} = {}", reg(*dst), rvalue_str(rvalue)),
         Inst::Store { local, src } => format!("_{} <- {}", local.0, operand(src)),
@@ -105,7 +102,7 @@ fn term_str(term: &Terminator) -> String {
     }
 }
 
-fn operand(o: &Operand) -> String {
+pub(super) fn operand(o: &Operand) -> String {
     match o {
         Operand::Const(c) => const_str(c),
         Operand::Reg(r) => reg(*r),

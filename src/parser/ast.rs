@@ -1,28 +1,23 @@
-//! The abstract syntax tree produced by the [parser](super).
+//! The abstract syntax tree built by the [parser](super).
 //!
-//! The AST is a faithful, lightly-structured mirror of the source: it keeps
-//! enough shape to type-check and lower, but performs no desugaring (that
-//! happens in [HIR lowering](crate::hir)). Every node carries a [`Span`] so any
-//! later phase can point diagnostics back at the source.
+//! The AST mirrors the source and is never mutated after parsing; desugaring
+//! happens in [HIR lowering](crate::hir). Every node has a [`Span`] for
+//! diagnostics.
 //!
-//! # Node identities
-//!
-//! Selected nodes carry a [`NodeId`], a small dense integer assigned by the
-//! parser. Later phases attach information to nodes through side tables keyed by
-//! `NodeId` (name resolution → [`Res`](crate::sema::Res); type checking →
-//! types) rather than mutating the tree. This keeps the AST immutable and the
-//! per-phase data cleanly separated, exactly as the architecture requires.
+//! Nodes that later phases annotate carry a [`NodeId`]. Name resolution and type
+//! checking record their results in side tables keyed by it
+//! ([`Resolution`](crate::sema::Resolution), [`Typeck`](crate::sema::Typeck)).
+
+use std::fmt;
 
 use crate::span::Span;
 
-/// A dense, unique identifier for an AST node.
-///
-/// Assigned by the parser via [`NodeIdGen`]. Used as the key for the side
-/// tables that resolution and type checking produce.
+/// A dense id for an AST node: the key of the side tables that resolution and
+/// type checking build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
-/// Monotonic allocator of [`NodeId`]s, owned by the parser.
+/// Hands out [`NodeId`]s in increasing order.
 #[derive(Debug, Default)]
 pub struct NodeIdGen {
     next: u32,
@@ -33,33 +28,33 @@ impl NodeIdGen {
         NodeIdGen::default()
     }
 
-    /// Returns a fresh id, never previously returned by this generator.
+    /// An id never returned before.
     pub fn fresh(&mut self) -> NodeId {
         let id = NodeId(self.next);
         self.next += 1;
         id
     }
 
-    /// The number of ids handed out so far, i.e. an upper bound on any `NodeId`.
+    /// How many ids have been handed out; every id is below this.
     pub fn count(&self) -> usize {
         self.next as usize
     }
 }
 
-/// An identifier occurrence: its text plus the span it was written at.
+/// An identifier and where it was written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ident {
     pub name: String,
     pub span: Span,
 }
 
-/// The root of a parsed program: a flat list of top-level items.
+/// A parsed program: its top-level items in source order.
 #[derive(Debug, Clone)]
 pub struct Ast {
     pub items: Vec<Item>,
 }
 
-/// A top-level item: a function, a constant, or a struct declaration.
+/// A top-level item.
 #[derive(Debug, Clone)]
 pub struct Item {
     pub id: NodeId,
@@ -74,7 +69,7 @@ pub enum ItemKind {
     Struct(StructDecl),
 }
 
-/// A struct declaration: `struct Name { field: T, ... }`.
+/// `struct Name { field: T, ... }`.
 #[derive(Debug, Clone)]
 pub struct StructDecl {
     pub id: NodeId,
@@ -82,7 +77,7 @@ pub struct StructDecl {
     pub fields: Vec<FieldDef>,
 }
 
-/// A single declared field.
+/// A struct field declaration.
 #[derive(Debug, Clone)]
 pub struct FieldDef {
     pub name: Ident,
@@ -90,8 +85,8 @@ pub struct FieldDef {
     pub span: Span,
 }
 
-/// A top-level constant: `const NAME: T = value;`. The value must be a
-/// compile-time constant expression; it is inlined at each use during lowering.
+/// `const NAME: T = value;`. The value must be a compile-time constant;
+/// lowering inlines it at each use.
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
     pub id: NodeId,
@@ -100,17 +95,17 @@ pub struct ConstDecl {
     pub value: Expr,
 }
 
-/// A function declaration: signature plus body block.
+/// `fn name(params) -> ret { body }`.
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: Ident,
     pub params: Vec<Param>,
-    /// The written return type, or `None` for the implicit `unit` return.
+    /// The declared return type; `None` means `unit`.
     pub ret: Option<TypeExpr>,
     pub body: Block,
 }
 
-/// A single function parameter.
+/// A function parameter.
 #[derive(Debug, Clone)]
 pub struct Param {
     pub id: NodeId,
@@ -119,8 +114,8 @@ pub struct Param {
     pub span: Span,
 }
 
-/// A syntactic type annotation, e.g. `i64`. Resolved to a semantic
-/// [`Type`](crate::sema::Type) during type checking.
+/// A type as written, e.g. `[i64]`. Type checking resolves it to a
+/// [`Type`](crate::sema::Type).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeExpr {
     pub kind: TypeExprKind,
@@ -129,20 +124,18 @@ pub struct TypeExpr {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeExprKind {
-    /// A named type such as `i64`, `bool`, or `str`.
+    /// A primitive or struct name, such as `i64`.
     Named(String),
-    /// An array type `[T]`.
+    /// `[T]`.
     Array(Box<TypeExpr>),
-    /// A tuple type `(T1, T2, ...)` with two or more elements.
+    /// `(T1, T2, ...)`. Never one element: `(T)` and `(T,)` parse as `T`.
     Tuple(Vec<TypeExpr>),
-    /// A placeholder inserted by the parser after a malformed annotation, so
-    /// recovery can continue. Type checking treats it as the error type and
-    /// emits no further diagnostic.
+    /// Stands in for a malformed type so parsing can continue. Type checking
+    /// treats it as an error without reporting it again.
     Error,
 }
 
-/// A braced block: a sequence of statements with an optional trailing
-/// expression whose value becomes the block's value (`unit` if absent).
+/// `{ stmts; tail }`. The tail is the block's value (`unit` if absent).
 #[derive(Debug, Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
@@ -161,7 +154,7 @@ pub struct Stmt {
 pub enum StmtKind {
     /// `let [mut] name [: ty] = init;`
     Let(LetStmt),
-    /// An expression evaluated for its side effects (`expr;`).
+    /// `expr;`, or a block-like expression without the `;`.
     Expr(Expr),
     /// `return [expr];`
     Return(Option<Expr>),
@@ -171,9 +164,9 @@ pub enum StmtKind {
     For(ForStmt),
     /// `for var in array { body }`
     ForEach(ForEachStmt),
-    /// `break;` - exit the innermost enclosing loop.
+    /// `break;`
     Break,
-    /// `continue;` - skip to the next iteration of the innermost loop.
+    /// `continue;`
     Continue,
 }
 
@@ -192,11 +185,11 @@ pub struct WhileStmt {
     pub body: Block,
 }
 
-/// `for var in start..end { body }`. The loop variable is an `i64` that takes
-/// each value in the half-open range `[start, end)`.
+/// `for var in start..end { body }`: `var` is an `i64` counting through
+/// `[start, end)`.
 #[derive(Debug, Clone)]
 pub struct ForStmt {
-    /// Definition id of the loop variable, for resolution/lowering.
+    /// The loop variable's definition id.
     pub id: NodeId,
     pub var: Ident,
     pub start: Expr,
@@ -204,11 +197,10 @@ pub struct ForStmt {
     pub body: Block,
 }
 
-/// `for var in array { body }`. The loop variable binds each element of the
-/// array in turn, so its type is the array's element type.
+/// `for var in array { body }`: `var` takes each element in turn.
 #[derive(Debug, Clone)]
 pub struct ForEachStmt {
-    /// Definition id of the loop variable, for resolution/lowering.
+    /// The loop variable's definition id.
     pub id: NodeId,
     pub var: Ident,
     pub iterable: Expr,
@@ -229,7 +221,7 @@ pub enum ExprKind {
     Float(f64),
     Bool(bool),
     Str(String),
-    /// A reference to a name (variable, parameter, or function).
+    /// A variable, parameter, constant, or function name.
     Name(String),
     Unary {
         op: UnOp,
@@ -244,54 +236,50 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
-    /// `target = value`. The target's validity as an lvalue is checked in
-    /// type checking, not the parser.
+    /// `target = value`. Type checking decides whether `target` is assignable.
     Assign {
         target: Box<Expr>,
         value: Box<Expr>,
     },
-    /// `target op= value`, e.g. `x += 1`. Desugared to a plain assignment
-    /// during lowering.
+    /// `target op= value`, e.g. `x += 1`.
     AssignOp {
         target: Box<Expr>,
         op: BinOp,
         value: Box<Expr>,
     },
-    /// An array literal `[e0, e1, ...]`.
+    /// `[e0, e1, ...]`
     ArrayLit(Vec<Expr>),
-    /// An indexing expression `base[index]`.
+    /// `base[index]`
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
     },
-    /// A struct literal `Name { field: value, ... }`.
+    /// `Name { field: value, ... }`
     StructLit {
         name: Ident,
         fields: Vec<FieldInit>,
     },
-    /// Field access `base.field`.
+    /// `base.field`
     Field {
         base: Box<Expr>,
         field: Ident,
     },
-    /// A tuple literal `(e0, e1, ...)` with two or more elements.
+    /// `(e0, e1, ...)`, including `()` and `(e,)`; plain `(e)` is grouping.
     TupleLit(Vec<Expr>),
-    /// Tuple element access `base.0`, `base.1`, ...
+    /// `base.0`, `base.1`, ...
     TupleIndex {
         base: Box<Expr>,
         index: usize,
-        /// Span of the numeric index, for diagnostics.
+        /// The index's span, for diagnostics.
         index_span: Span,
     },
     If(IfExpr),
-    /// `match scrutinee { pat => body, ... }`.
     Match(MatchExpr),
     Block(Block),
 }
 
-/// `match scrutinee { arm, arm, ... }`. The scrutinee is an integer or boolean;
-/// each arm matches a literal value or the wildcard `_`. Desugared to a chain
-/// of `if`/`else` during lowering, so it adds no node to the HIR.
+/// `match scrutinee { pat => body, ... }` over an `i64` or `bool`. Lowering
+/// turns it into an `if`/`else` chain, so HIR has no match node.
 #[derive(Debug, Clone)]
 pub struct MatchExpr {
     pub scrutinee: Box<Expr>,
@@ -306,38 +294,48 @@ pub struct MatchArm {
     pub span: Span,
 }
 
-/// A `match` arm pattern: a scalar literal or the catch-all wildcard.
+/// A `match` pattern: a literal or `_`.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Int(i64),
     Bool(bool),
-    /// The wildcard `_`, matching any value.
+    /// `_`, matching anything.
     Wild,
 }
 
-/// A `field: value` pair in a struct literal.
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Pattern::Int(v) => write!(f, "{v}"),
+            Pattern::Bool(b) => write!(f, "{b}"),
+            Pattern::Wild => f.write_str("_"),
+        }
+    }
+}
+
+/// `field: value` in a struct literal.
 #[derive(Debug, Clone)]
 pub struct FieldInit {
     pub name: Ident,
     pub value: Expr,
 }
 
-/// `if cond { then } [else (block | if)]`. An `if` is an expression; its value
-/// is that of the taken branch (or `unit` when there is no `else`).
+/// `if cond { then } [else ...]`. Its value is the taken branch's, or `unit`
+/// without an `else`.
 #[derive(Debug, Clone)]
 pub struct IfExpr {
     pub cond: Box<Expr>,
     pub then_branch: Block,
-    /// Always a `Block` or another `If` expression when present.
+    /// A `Block` or `If` expression.
     pub else_branch: Option<Box<Expr>>,
 }
 
 /// Unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
-    /// Arithmetic negation `-`.
+    /// `-`
     Neg,
-    /// Logical negation `!`.
+    /// `!`
     Not,
 }
 
@@ -388,22 +386,75 @@ impl BinOp {
         }
     }
 
-    /// Whether this is a comparison/equality operator (result is always `bool`).
+    /// Binding strength, from 1 (`||`) to 6 (`*`, `/`, `%`). All binary
+    /// operators are left-associative.
+    pub fn precedence(self) -> u8 {
+        use BinOp::*;
+        match self {
+            Or => 1,
+            And => 2,
+            Eq | Ne => 3,
+            Lt | Le | Gt | Ge => 4,
+            Add | Sub => 5,
+            Mul | Div | Rem => 6,
+        }
+    }
+
+    /// Whether this is `==`, `!=`, `<`, `<=`, `>`, or `>=`, which yield `bool`.
     pub fn is_comparison(self) -> bool {
         use BinOp::*;
         matches!(self, Eq | Ne | Lt | Le | Gt | Ge)
     }
 
-    /// Whether this is a short-circuiting logical operator.
+    /// Whether this is the short-circuiting `&&` or `||`.
     pub fn is_logical(self) -> bool {
         matches!(self, BinOp::And | BinOp::Or)
+    }
+
+    /// `a op b` for an arithmetic operator on integers, wrapping on overflow
+    /// like the VM. `None` for other operators, and for a division or
+    /// remainder that traps at runtime (by zero, or `i64::MIN / -1`).
+    pub fn fold_int(self, a: i64, b: i64) -> Option<i64> {
+        match self {
+            BinOp::Add => Some(a.wrapping_add(b)),
+            BinOp::Sub => Some(a.wrapping_sub(b)),
+            BinOp::Mul => Some(a.wrapping_mul(b)),
+            BinOp::Div => a.checked_div(b),
+            BinOp::Rem => a.checked_rem(b),
+            _ => None,
+        }
+    }
+
+    /// `a op b` for an arithmetic operator on floats; `None` for other
+    /// operators.
+    pub fn fold_float(self, a: f64, b: f64) -> Option<f64> {
+        match self {
+            BinOp::Add => Some(a + b),
+            BinOp::Sub => Some(a - b),
+            BinOp::Mul => Some(a * b),
+            BinOp::Div => Some(a / b),
+            BinOp::Rem => Some(a % b),
+            _ => None,
+        }
+    }
+
+    /// `a op b` for a comparison operator; `None` for other operators.
+    pub fn compare<T: PartialOrd>(self, a: T, b: T) -> Option<bool> {
+        match self {
+            BinOp::Eq => Some(a == b),
+            BinOp::Ne => Some(a != b),
+            BinOp::Lt => Some(a < b),
+            BinOp::Le => Some(a <= b),
+            BinOp::Gt => Some(a > b),
+            BinOp::Ge => Some(a >= b),
+            _ => None,
+        }
     }
 }
 
 impl Expr {
-    /// Whether this expression form may stand as a statement without a trailing
-    /// semicolon (block-like: `{ … }` and `if …`). Used by the parser's
-    /// statement loop to mirror Rust's ergonomics.
+    /// Whether this is `{ ... }` or `if ...`, which may end a statement without
+    /// a `;`.
     pub fn is_block_like(&self) -> bool {
         matches!(self.kind, ExprKind::Block(_) | ExprKind::If(_))
     }

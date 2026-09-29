@@ -1,36 +1,31 @@
-//! The source file and line-index used for diagnostics.
+//! Source text plus a line index for turning byte offsets into `line:column`.
 //!
-//! A [`SourceFile`] owns the program text and a precomputed table of line-start
-//! byte offsets. The table is built once and lets us translate a byte offset to
-//! a human `line:column` in `O(log n)` via binary search, which keeps
-//! diagnostic rendering cheap even for large inputs.
+//! Line starts are computed once, so [`SourceFile::location`] is a binary
+//! search.
 
 use crate::span::Span;
 
-/// A 1-based line/column location within a source file.
-///
-/// Columns are counted in Unicode scalar values (`char`s), not bytes, so a
-/// multi-byte character advances the column by one  matching what a user sees
-/// in an editor.
+/// A 1-based line and column. Columns count `char`s, not bytes, matching what
+/// an editor shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Location {
-    /// 1-based line number.
+    /// 1-based line.
     pub line: u32,
-    /// 1-based column number, counted in characters.
+    /// 1-based column, in `char`s.
     pub column: u32,
 }
 
-/// An owned source file: its display name, full text, and line index.
+/// A source file: display name, text, and line index.
 #[derive(Debug, Clone)]
 pub struct SourceFile {
     name: String,
     src: String,
-    /// Byte offset of the first character of each line. Always starts with `0`.
+    /// Byte offset of each line's first character; always starts with `0`.
     line_starts: Vec<u32>,
 }
 
 impl SourceFile {
-    /// Builds a source file from a display `name` and its `src` text.
+    /// Creates a source file and indexes its lines.
     pub fn new(name: impl Into<String>, src: impl Into<String>) -> SourceFile {
         let src = src.into();
         let line_starts = line_starts(&src);
@@ -41,7 +36,7 @@ impl SourceFile {
         }
     }
 
-    /// The display name (typically a path) used in diagnostics.
+    /// The display name used in diagnostics, usually the path.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -51,29 +46,22 @@ impl SourceFile {
         &self.src
     }
 
-    /// The text covered by `span`.
-    ///
-    /// Returns `""` if the span lies outside the source (which only happens for
-    /// synthetic spans). This never panics, satisfying the rule that diagnostic
-    /// machinery must be infallible.
+    /// The text under `span`, or `""` if it is out of bounds. Never panics.
     pub fn snippet(&self, span: Span) -> &str {
         let range = span.range();
         self.src.get(range).unwrap_or("")
     }
 
-    /// Translates a byte offset to a 1-based [`Location`].
-    ///
-    /// Offsets past the end of the file clamp to the final position, so callers
-    /// (e.g. an EOF span) always get a sensible answer.
+    /// The location of byte `offset`, which must be on a `char` boundary.
+    /// Offsets past the end clamp to the end of the file.
     pub fn location(&self, offset: u32) -> Location {
         let offset = offset.min(self.src.len() as u32);
-        // `line_starts` is sorted; find the last start <= offset.
+        // The line is the last one starting at or before `offset`.
         let line_idx = match self.line_starts.binary_search(&offset) {
             Ok(idx) => idx,
             Err(idx) => idx - 1,
         };
         let line_start = self.line_starts[line_idx];
-        // Column = number of chars between the line start and the offset, + 1.
         let column = self.src[line_start as usize..offset as usize]
             .chars()
             .count() as u32
@@ -84,7 +72,8 @@ impl SourceFile {
         }
     }
 
-    /// Returns the full text of the 1-based `line`, without its terminator.
+    /// The text of 1-based `line` without its terminator, or `""` if there is
+    /// no such line.
     pub fn line_text(&self, line: u32) -> &str {
         if line == 0 || line as usize > self.line_starts.len() {
             return "";
@@ -98,13 +87,13 @@ impl SourceFile {
         self.src[start..end].trim_end_matches(['\n', '\r'])
     }
 
-    /// The number of lines in the file (always at least 1).
+    /// The number of lines; at least 1.
     pub fn line_count(&self) -> u32 {
         self.line_starts.len() as u32
     }
 }
 
-/// Computes the byte offset of the start of each line.
+/// The byte offset at which each line starts.
 fn line_starts(src: &str) -> Vec<u32> {
     let mut starts = vec![0u32];
     for (idx, byte) in src.bytes().enumerate() {

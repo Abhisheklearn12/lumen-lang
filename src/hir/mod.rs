@@ -1,22 +1,12 @@
-//! The High-level Intermediate Representation.
+//! HIR, the high-level IR: the AST with names resolved, types attached, and
+//! sugar removed. The optimizer and every backend work on it.
 //!
-//! HIR is the AST after name resolution and type checking have been "baked in".
-//! It is the representation the optimizer and code generator work on, and it is
-//! deliberately **self-contained**: unlike the AST, it carries no [`NodeId`]s
-//! and depends on no external side tables. Every expression records its
-//! [`Type`]; every variable reference is a dense [`LocalId`]; every call names
-//! its target directly as a [`Callee`].
-//!
-//! # What lowering desugars
-//!
-//! * Names → [`LocalId`] (locals/parameters) or a [`Callee`] (functions).
-//! * Parameters and `let` bindings are unified into a single per-function array
-//!   of [`LocalDecl`]s, so the backend can assign stack slots by index.
-//! * Types annotations and inference results become concrete [`Type`]s on nodes.
-//!
-//! Operators ([`UnOp`], [`BinOp`]) are reused from the AST: they are language
-//! constants, not syntax-phase state, so re-defining them would be needless
-//! duplication.
+//! Unlike the AST it is self-contained, with no
+//! [`NodeId`](crate::parser::ast::NodeId)s or side tables: every expression
+//! carries its [`Type`], variables are dense [`LocalId`] slots, and calls name
+//! a [`Callee`]. Lowering removes compound assignment, `match` (an `if`
+//! chain), `for … in` over arrays (an index loop), constants (inlined), and
+//! tuples (struct values).
 
 pub mod lower;
 pub mod print;
@@ -30,22 +20,22 @@ mod tests;
 use crate::sema::types::{Builtin, Type};
 use crate::span::Span;
 
-// Operators are pure language data; share the AST's definitions.
+// Operators mean the same in every representation.
 pub use crate::parser::ast::{BinOp, UnOp};
 
-/// Identifies a function by dense index, shared with name resolution so a
-/// [`Callee::Fn`] indexes directly into [`Hir::functions`].
+/// Function ids come from name resolution; [`Callee::Fn`] indexes
+/// [`Hir::functions`] with them.
 pub use crate::sema::resolve::FnId;
 
-/// A local slot within a function: parameters first, then `let` bindings, in
-/// declaration order. Indexes into [`Function::locals`].
+/// A local slot, indexing [`Function::locals`]: parameters first, then other
+/// locals in allocation order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalId(pub u32);
 
-/// A fully-lowered program.
+/// A lowered program.
 #[derive(Debug)]
 pub struct Hir {
-    /// Functions indexed by [`FnId`].
+    /// Indexed by [`FnId`].
     pub functions: Vec<Function>,
     /// The entry point.
     pub main: FnId,
@@ -55,7 +45,7 @@ pub struct Hir {
 #[derive(Debug)]
 pub struct Function {
     pub name: String,
-    /// All locals; the first `param_count` are the parameters.
+    /// Every local slot; the first `param_count` are the parameters.
     pub locals: Vec<LocalDecl>,
     pub param_count: usize,
     pub ret: Type,
@@ -63,46 +53,46 @@ pub struct Function {
 }
 
 impl Function {
-    /// The parameter locals.
+    /// The parameter slots.
     pub fn params(&self) -> &[LocalDecl] {
         &self.locals[..self.param_count]
     }
 }
 
-/// Declaration of a single local slot.
+/// A local slot's name and type.
 #[derive(Debug, Clone)]
 pub struct LocalDecl {
     pub name: String,
     pub ty: Type,
 }
 
-/// A lowered block: statements followed by an optional value-producing tail.
+/// Statements followed by an optional tail value.
 #[derive(Debug, Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub tail: Option<Box<Expr>>,
-    /// The block's value type (the tail's type, or `unit`).
+    /// The tail's type, or `unit`.
     pub ty: Type,
 }
 
-/// A lowered statement.
+/// A statement.
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    /// Initialise a local slot.
-    Let { local: LocalId, value: Expr },
-    /// Evaluate an expression for effect, discarding its value.
+    /// Initialises a local.
+    Let {
+        local: LocalId,
+        value: Expr,
+    },
+    /// Evaluates an expression and discards its value.
     Expr(Expr),
-    /// Return from the enclosing function.
     Return(Option<Expr>),
-    /// Loop while `cond` holds.
-    While { cond: Expr, body: Block },
-    /// Count `var` over the half-open range `[start, end)`.
-    ///
-    /// Kept as a distinct node (rather than desugared to `while`) so the code
-    /// generator can route `continue` to the increment rather than the
-    /// condition, preserving correct loop semantics. `end_var` is a hidden slot
-    /// that caches the upper bound, so `end` is evaluated exactly once even if
-    /// it has side effects.
+    While {
+        cond: Expr,
+        body: Block,
+    },
+    /// Counts `var` through `[start, end)`. It is not desugared to `While` so
+    /// that `continue` can jump to the increment. The hidden `end_var` holds
+    /// `end`, which is evaluated once.
     For {
         var: LocalId,
         end_var: LocalId,
@@ -110,13 +100,11 @@ pub enum Stmt {
         end: Expr,
         body: Block,
     },
-    /// Exit the innermost loop.
     Break,
-    /// Jump to the next iteration of the innermost loop.
     Continue,
 }
 
-/// A lowered, fully-typed expression.
+/// A typed expression.
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
@@ -130,7 +118,7 @@ pub enum ExprKind {
     Float(f64),
     Bool(bool),
     Str(String),
-    /// Read a local/parameter slot.
+    /// Reads a local.
     Local(LocalId),
     Unary {
         op: UnOp,
@@ -141,37 +129,37 @@ pub enum ExprKind {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
-    /// Call a function or builtin (Lumen has no indirect calls).
+    /// A direct call; there are no function values.
     Call {
         callee: Callee,
         args: Vec<Expr>,
     },
-    /// Assign to a local slot; evaluates to `unit`.
+    /// Stores to a local; evaluates to `unit`.
     Assign {
         local: LocalId,
         value: Box<Expr>,
     },
-    /// An array literal; evaluates to a fresh array.
+    /// Allocates a new array.
     ArrayLit(Vec<Expr>),
-    /// Read `base[index]`.
+    /// Reads `base[index]`.
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
     },
-    /// Store `base[index] = value`; evaluates to `unit`.
+    /// Stores `base[index] = value`; evaluates to `unit`.
     SetIndex {
         base: Box<Expr>,
         index: Box<Expr>,
         value: Box<Expr>,
     },
-    /// A struct value, with field values in declaration order.
+    /// A struct or tuple value, fields in declaration order.
     StructLit(Vec<Expr>),
-    /// Read field `idx` of a struct.
+    /// Reads field `idx` of a struct or tuple.
     GetField {
         base: Box<Expr>,
         idx: u32,
     },
-    /// Store field `idx` of a struct; evaluates to `unit`.
+    /// Stores field `idx`; evaluates to `unit`.
     SetField {
         base: Box<Expr>,
         idx: u32,
@@ -185,7 +173,7 @@ pub enum ExprKind {
     Block(Block),
 }
 
-/// The target of a [`ExprKind::Call`].
+/// A call target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Callee {
     Fn(FnId),
@@ -193,7 +181,7 @@ pub enum Callee {
 }
 
 impl Expr {
-    /// Constructs an expression node.
+    /// Creates an expression.
     pub fn new(kind: ExprKind, ty: Type, span: Span) -> Expr {
         Expr { kind, ty, span }
     }

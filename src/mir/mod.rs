@@ -1,23 +1,14 @@
-//! The Mid-level Intermediate Representation: a control-flow graph in
-//! three-address form.
+//! MIR, the mid-level IR: each function is a control-flow graph of basic
+//! blocks in three-address form.
 //!
-//! # Why a second IR?
+//! HIR is a tree, which suits code generation but not data-flow analysis. Here
+//! a [`Function`] is a list of [`Block`]s, each a straight line of [`Inst`]s
+//! ending in a [`Terminator`]. Nested expressions become single-assignment
+//! registers ([`Reg`]), and `if`, loops, and `&&`/`||` become explicit
+//! branches, the form the [optimizer](opt) works on.
 //!
-//! [`Hir`](crate::hir) is a typed *tree* - convenient for type-directed code
-//! generation, but awkward for the classic data-flow optimizations, which want
-//! an explicit control-flow graph and instructions with named results. MIR
-//! provides exactly that: each [`Function`] is a list of [`Block`]s, each block
-//! a straight-line sequence of [`Inst`]s ending in a [`Terminator`]. Nested
-//! expressions are flattened into temporaries ([`Reg`]), and all control flow -
-//! `if`, `while`, `for`, and short-circuit `&&`/`||` - becomes explicit branches.
-//!
-//! On this form the [optimizer](opt) runs constant folding, constant and copy
-//! propagation, dead-code elimination, and CFG simplification, none of which are
-//! natural on a tree.
-//!
-//! MIR is built from optimized HIR and is inspectable via `lumenc dump mir`; it
-//! is an analysis and optimization layer that complements the HIR→bytecode code
-//! generator.
+//! MIR is not on the path from source to bytecode. `lumenc dump mir` and
+//! `dump cfg` show it, and its [interpreter](interp) cross-checks the VM.
 
 pub mod build;
 pub mod dot;
@@ -35,32 +26,32 @@ use crate::hir::{BinOp, Callee, LocalDecl, UnOp};
 use crate::sema::types::Type;
 use std::rc::Rc;
 
-/// A basic-block identifier, dense within a function.
+/// A block's index in [`Function::blocks`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(pub u32);
 
-/// A virtual register (SSA-like temporary), dense within a function.
+/// A virtual register, written by at most one instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Reg(pub u32);
 
-/// A local-variable slot, shared with HIR's numbering.
+/// Local slots are numbered as in HIR.
 pub use crate::hir::LocalId;
 
-/// A whole program in MIR form.
+/// A program in MIR form.
 #[derive(Debug)]
 pub struct Program {
     pub functions: Vec<Function>,
-    /// Index of the entry function (`main`) in [`Program::functions`].
+    /// The index of `main` in [`Program::functions`].
     pub main: usize,
 }
 
-/// A function: its locals, register count, and control-flow graph.
+/// A function: its locals and control-flow graph.
 #[derive(Debug)]
 pub struct Function {
     pub name: String,
     pub param_count: usize,
     pub locals: Vec<LocalDecl>,
-    /// Number of virtual registers allocated.
+    /// The number of registers used.
     pub reg_count: usize,
     pub blocks: Vec<Block>,
     pub entry: BlockId,
@@ -76,14 +67,14 @@ impl Function {
     }
 }
 
-/// A basic block: straight-line instructions then a terminator.
+/// A basic block: straight-line instructions, then a terminator.
 #[derive(Debug)]
 pub struct Block {
     pub insts: Vec<Inst>,
     pub term: Terminator,
 }
 
-/// A compile-time constant operand.
+/// A constant operand.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Const {
     Int(i64),
@@ -101,7 +92,7 @@ pub enum Operand {
 }
 
 impl Operand {
-    /// The register this operand reads, if any.
+    /// The register read, if any.
     pub fn reg(&self) -> Option<Reg> {
         match self {
             Operand::Reg(r) => Some(*r),
@@ -110,25 +101,24 @@ impl Operand {
     }
 }
 
-/// A value-producing computation assigned to a register.
+/// A computation whose result is written to a register.
 #[derive(Debug, Clone)]
 pub enum Rvalue {
-    /// Copy an operand.
+    /// A copy of an operand.
     Use(Operand),
-    /// Read a local variable.
+    /// Reads a local.
     Load(LocalId),
     Unary(UnOp, Operand),
     Binary(BinOp, Operand, Operand),
-    /// `a ++ b` string concatenation.
+    /// String concatenation, printed `a ++ b`.
     Concat(Operand, Operand),
-    /// Build an array from element operands.
+    /// A new array, which also represents structs and tuples.
     MakeArray(Vec<Operand>),
-    /// `base[index]`.
+    /// `base[index]`, which also reads struct and tuple fields.
     Index(Operand, Operand),
 }
 
-/// A single MIR instruction. All have an explicit result register except the
-/// effecting stores.
+/// An instruction. All but the two stores write a register.
 #[derive(Debug)]
 pub enum Inst {
     /// `dst = rvalue`
@@ -141,7 +131,7 @@ pub enum Inst {
         index: Operand,
         value: Operand,
     },
-    /// `dst = callee(args)` (may have side effects).
+    /// `dst = callee(args)`; may have side effects.
     Call {
         dst: Reg,
         callee: Callee,
@@ -150,26 +140,23 @@ pub enum Inst {
     },
 }
 
-/// How a block transfers control.
+/// How a block ends.
 #[derive(Debug, Clone)]
 pub enum Terminator {
-    /// Jump unconditionally.
     Goto(BlockId),
-    /// Branch on a boolean operand.
+    /// Goes to `then_bb` if `cond` is true, else to `else_bb`.
     Branch {
         cond: Operand,
         then_bb: BlockId,
         else_bb: BlockId,
     },
-    /// Return a value from the function.
     Return(Operand),
-    /// Placeholder used transiently while building; never present in finished
-    /// MIR.
+    /// Not yet terminated; only seen while MIR is being built.
     Unreachable,
 }
 
 impl Terminator {
-    /// The blocks this terminator may transfer control to.
+    /// The blocks control may go to next.
     pub fn successors(&self) -> Vec<BlockId> {
         match self {
             Terminator::Goto(b) => vec![*b],

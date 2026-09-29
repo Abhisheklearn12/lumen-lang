@@ -1,15 +1,12 @@
-//! A deterministic disassembler for [`Program`] bytecode.
-//!
-//! Renders each chunk as a header plus a numbered instruction listing, for
-//! snapshot tests and `lumenc --dump bytecode`. Instruction indices are shown
-//! so jump targets are easy to follow. Output is stable across runs.
+//! The disassembler behind `lumenc dump bytecode`: each function's header,
+//! then its instructions numbered by index, which is what jumps refer to.
 
 use std::fmt::Write as _;
 
-use crate::backend::bytecode::{Op, Program};
+use crate::backend::bytecode::{Chunk, Op, Program};
 use crate::sema::types::Builtin;
 
-/// Renders a whole program's bytecode to a string.
+/// Renders a whole program.
 pub fn disassemble(program: &Program) -> String {
     let mut out = String::new();
     for (idx, chunk) in program.functions.iter().enumerate() {
@@ -26,7 +23,7 @@ pub fn disassemble(program: &Program) -> String {
     out
 }
 
-fn render_op(op: &Op, chunk: &crate::backend::bytecode::Chunk) -> String {
+fn render_op(op: &Op, chunk: &Chunk) -> String {
     match op {
         Op::PushInt(v) => format!("push_int {v}"),
         Op::PushFloat(v) => format!("push_float {v}"),

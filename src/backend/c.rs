@@ -1,37 +1,35 @@
-//! A C transpiler: a second backend that emits portable C99 from
-//! [`Hir`](crate::hir).
+//! A second backend: C99 source from [HIR](crate::hir), shown by
+//! `lumenc dump c`.
 //!
-//! # Scope
+//! It covers the scalar subset: `i64`, `f64`, `bool`, and `unit`, with
+//! functions, recursion, and all control flow. Strings, arrays, structs, and
+//! tuples would need a C runtime, so they fail with [`CError::Unsupported`], as
+//! do builtins other than `print_int`, `print_float`, `print_bool`, `abs`,
+//! `min`, and `max`.
 //!
-//! This backend targets the **scalar subset** of Lumen - `i64`, `f64`, `bool`,
-//! and `unit`, with functions, recursion, and all control flow. The heap types
-//! (`str`, arrays, structs) would require a reference-counted C runtime; rather
-//! than ship a half-finished one, the transpiler reports a clear
-//! [`CError::Unsupported`] when it meets them. Programs in the scalar subset
-//! transpile to clean, warning-free C that any C99 compiler accepts.
+//! An expression returns C text; forms C has no expression for (an `if` used as
+//! a value, a print) first emit statements, and an `if` leaves its value in a
+//! temporary. Integer arithmetic goes through helpers that wrap like the VM and
+//! exit on division by zero or overflow.
 //!
-//! # How it works
-//!
-//! Lumen and C are both expression/statement languages, but Lumen's `if` and
-//! blocks are *expressions*. The emitter flattens those: a value-position `if`
-//! evaluates each arm into a fresh temporary and the surrounding expression
-//! reads it, mirroring the strategy used by [MIR construction](crate::mir).
-//! Integer arithmetic is emitted with explicit wrapping helpers so it matches
-//! the VM's semantics exactly.
+//! Known gaps: those statements run before the whole enclosing expression, so
+//! on the right of `&&` or `||` they run even when it short-circuits; a bare
+//! `return;` is emitted in a function returning `int64_t`, which C99 forbids;
+//! and `print_float` uses `%g`, which can differ from the VM's output.
 
 use std::fmt::Write as _;
 
 use crate::hir::{BinOp, Block, Callee, Expr, ExprKind, Function, Hir, Stmt, UnOp};
 use crate::sema::types::{Builtin, Type};
 
-/// Why C generation failed.
+/// Why a program cannot be emitted as C.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CError {
     #[error("the C backend does not support {0} (only the scalar subset is supported)")]
     Unsupported(&'static str),
 }
 
-/// Transpiles a program to a self-contained C99 translation unit.
+/// Emits a program as one self-contained C99 file.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn emit_c(hir: &Hir) -> Result<String, CError> {
     let fn_names = hir.functions.iter().map(|f| f.name.clone()).collect();
@@ -42,7 +40,7 @@ pub fn emit_c(hir: &Hir) -> Result<String, CError> {
         fn_names,
     };
     e.preamble();
-    // Forward declarations so functions may call each other in any order.
+    // Prototypes, so functions may call each other in any order.
     for func in &hir.functions {
         let proto = e.signature(func)?;
         let _ = writeln!(e.out, "{proto};");
@@ -59,7 +57,7 @@ struct Emitter {
     out: String,
     tmp: usize,
     depth: usize,
-    /// Function names indexed by `FnId`, for resolving call targets.
+    /// Function names, indexed by `FnId`.
     fn_names: Vec<String>,
 }
 
@@ -126,7 +124,7 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
         self.out.push('\n');
     }
 
-    /// The C function signature for a Lumen function (no trailing `;`).
+    /// `func`'s C signature, without a trailing `;`.
     fn signature(&self, func: &Function) -> Result<String, CError> {
         let ret = c_type(func.ret)?;
         let params = func
@@ -148,16 +146,15 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
         let proto = self.signature(func)?;
         let _ = writeln!(self.out, "{proto} {{");
         self.depth += 1;
-        // Declare non-parameter locals (parameters are C function arguments).
+        // Parameters are C parameters; declare the other locals.
         for (i, local) in func.locals.iter().enumerate().skip(func.param_count) {
             let ty = c_type(local.ty)?;
             self.line(&format!("{ty} _{i} = {};", zero_value(local.ty)));
         }
-        // The body is a value-producing block; compute it and return it.
         let value = self.expr_block(&func.body)?;
         if matches!(func.ret, Type::Unit) {
-            // Unit functions still return an `int64_t` (0) so a call is always a
-            // valid C value expression; the result is discarded by callers.
+            // A `unit` function returns `int64_t` 0, so every call is a valid
+            // C expression.
             self.line(&format!("(void)({value});"));
             self.line("return 0;");
         } else {
@@ -168,7 +165,7 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
         Ok(())
     }
 
-    /// Emits a block in value position, returning a C expression for its value.
+    /// Emits a block's statements, returning C for its value.
     fn expr_block(&mut self, block: &Block) -> Result<String, CError> {
         for stmt in &block.stmts {
             self.stmt(stmt)?;
@@ -231,9 +228,7 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
         Ok(())
     }
 
-    /// Emits an expression, returning a C expression string for its value.
-    /// Side-effecting or statement-shaped forms emit preceding statements and
-    /// return a temporary.
+    /// Returns C for `expr`'s value, first emitting any statements it needs.
     fn expr(&mut self, expr: &Expr) -> Result<String, CError> {
         match &expr.kind {
             ExprKind::Int(v) => Ok(format!("INT64_C({v})")),
@@ -250,7 +245,7 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
                 })
             }
             ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs),
-            ExprKind::Call { callee, args } => self.call(*callee, args, expr.ty),
+            ExprKind::Call { callee, args } => self.call(*callee, args),
             ExprKind::Assign { local, value } => {
                 let v = self.expr(value)?;
                 self.line(&format!("_{} = {v};", local.0));
@@ -272,7 +267,6 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<String, CError> {
-        // Short-circuit operators map directly onto C's.
         let l = self.expr(lhs)?;
         let r = self.expr(rhs)?;
         let is_int = lhs.ty == Type::Int;
@@ -298,7 +292,7 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
         })
     }
 
-    fn call(&mut self, callee: Callee, args: &[Expr], ret: Type) -> Result<String, CError> {
+    fn call(&mut self, callee: Callee, args: &[Expr]) -> Result<String, CError> {
         let arg_strs = args
             .iter()
             .map(|a| self.expr(a))
@@ -308,11 +302,11 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
                 let name = c_name(&self.fn_names[id.0 as usize]);
                 Ok(format!("{name}({})", arg_strs.join(", ")))
             }
-            Callee::Builtin(b) => self.builtin_call(b, &arg_strs, ret),
+            Callee::Builtin(b) => self.builtin_call(b, &arg_strs),
         }
     }
 
-    fn builtin_call(&mut self, b: Builtin, args: &[String], _ret: Type) -> Result<String, CError> {
+    fn builtin_call(&mut self, b: Builtin, args: &[String]) -> Result<String, CError> {
         let arg = args.first().cloned().unwrap_or_default();
         match b {
             Builtin::PrintInt => {
@@ -329,7 +323,6 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
                 ));
                 Ok("0".to_string())
             }
-            // Integer math maps onto C expressions (no libm needed).
             Builtin::AbsInt => Ok(format!("(({arg}) < 0 ? lm_sub(0, {arg}) : ({arg}))")),
             Builtin::MinInt => {
                 let b = args.get(1).cloned().unwrap_or_default();
@@ -339,7 +332,7 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
                 let b = args.get(1).cloned().unwrap_or_default();
                 Ok(format!("(({arg}) > ({b}) ? ({arg}) : ({b}))"))
             }
-            // String, array, and float-math builtins need a C runtime / libm.
+            // The rest need a C runtime or libm.
             _ => Err(CError::Unsupported("this builtin in the C backend")),
         }
     }
@@ -372,7 +365,7 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
         Ok(result)
     }
 
-    /// Emits a C `main` that calls the Lumen entry point.
+    /// Emits a C `main` that calls Lumen's.
     fn main_shim(&mut self, hir: &Hir) {
         let entry = &hir.functions[hir.main.0 as usize];
         let _ = writeln!(
@@ -383,7 +376,7 @@ static inline int64_t lm_rem(int64_t a, int64_t b) {
     }
 }
 
-/// The C type for a Lumen scalar type.
+/// The C type for a scalar type.
 fn c_type(ty: Type) -> Result<&'static str, CError> {
     match ty {
         Type::Int => Ok("int64_t"),
@@ -398,7 +391,7 @@ fn c_type(ty: Type) -> Result<&'static str, CError> {
     }
 }
 
-/// A zero-initialiser for a scalar type.
+/// A zero value of a scalar type.
 fn zero_value(ty: Type) -> &'static str {
     match ty {
         Type::Float => "0.0",
@@ -407,7 +400,7 @@ fn zero_value(ty: Type) -> &'static str {
     }
 }
 
-/// Mangles a Lumen function name into a valid, collision-free C identifier.
+/// The C name of a Lumen function, prefixed so it cannot clash with C's.
 fn c_name(name: &str) -> String {
     format!("lm_fn_{name}")
 }

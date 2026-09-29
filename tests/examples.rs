@@ -1,6 +1,4 @@
-//! Verifies that every bundled example program compiles and runs, producing its
-//! expected output. This keeps the `examples/` directory honest: a change that
-//! breaks an example fails CI.
+//! Every program in `examples/` must run and print exactly what is expected.
 
 mod common;
 

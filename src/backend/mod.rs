@@ -1,15 +1,17 @@
-//! The backend: bytecode definition, code generation, the VM, and a
-//! disassembler.
+//! The backend: bytecode, its compiler and VM, and a C emitter.
 //!
-//! * [`bytecode`]  [`Value`](bytecode::Value), the [`Op`](bytecode::Op)
-//!   instruction set, and the [`Program`](bytecode::Program) container.
-//! * [`codegen`]  lowers [`Hir`](crate::hir) to a [`Program`].
-//! * [`vm`]  executes a [`Program`], capturing output.
-//! * [`disasm`]  renders bytecode for inspection and snapshot tests.
+//! * [`bytecode`]: [`Value`], the [`Op`] instruction set, and [`Program`].
+//! * [`codegen`]: HIR to bytecode.
+//! * [`peephole`]: bytecode clean-up after codegen.
+//! * [`vm`]: runs a [`Program`].
+//! * [`builtins`]: the builtin functions, shared with the MIR interpreter.
+//! * [`mod@verify`]: checks untrusted bytecode before it runs.
+//! * [`object`]: a text format for saving and loading programs.
+//! * [`disasm`]: a readable bytecode listing.
+//! * [`c`]: HIR to C, for the scalar subset of the language.
 //!
-//! The backend depends only on [`Hir`](crate::hir) (and the shared
-//! [`types`](crate::sema::types)); it knows nothing of the AST, tokens, or
-//! diagnostics, keeping the phase boundary clean.
+//! It reads only [HIR](crate::hir) and the [types](crate::sema::types), never
+//! the AST, tokens, or diagnostics.
 
 pub mod builtins;
 pub mod bytecode;

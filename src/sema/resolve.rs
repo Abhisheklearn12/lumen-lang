@@ -1,24 +1,11 @@
-//! Name resolution: binds every identifier *use* to the *definition* it refers
-//! to, before type checking runs.
+//! Name resolution: binds every name use to its definition.
 //!
-//! # Design
-//!
-//! The resolver walks the AST with a stack of lexical scopes. It does not
-//! mutate the tree; instead it produces a [`Resolution`] of side tables keyed by
-//! [`NodeId`]:
-//!
-//! * `uses` maps each `Name` expression to a [`Res`] (local, user function, or
-//!   builtin).
-//! * `locals` maps each binding's definition node to its [`LocalInfo`]
-//!   (mutability/name/span), which type checking consults for assignment checks.
-//! * `functions` is the global [`FunctionTable`].
-//!
-//! Functions are collected in a first pass so calls may refer to functions
-//! declared later and to themselves (recursion). Within a function, parameters
-//! and `let` bindings live in nested scopes; a `let` becomes visible only
-//! *after* its initialiser, so `let x = x;` sees the outer `x`. Re-binding a
-//! name in the same scope is permitted (shadowing); duplicate *parameters* are
-//! not.
+//! The result is a [`Resolution`] of side tables keyed by [`NodeId`]; the AST is
+//! left untouched. Top-level names (functions, constants, structs) share one
+//! namespace and are collected first, so items may refer to each other in any
+//! order. Inside a function, parameters and `let`s live in nested scopes. A
+//! `let` is visible only after its initialiser (`let x = x;` reads the outer
+//! `x`) and may shadow an earlier binding; repeating a parameter is an error.
 
 use std::collections::HashMap;
 
@@ -28,32 +15,29 @@ use crate::parser::ast::*;
 use crate::sema::types::Builtin;
 use crate::span::Span;
 
-/// Identifies a user-defined function by dense index.
+/// A user function, by its index in [`Resolution::functions`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FnId(pub u32);
 
-/// Identifies a top-level constant by dense index.
+/// A constant, by its index in [`Resolution::consts`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ConstId(pub u32);
 
-/// Identifies a declared struct by dense index.
+/// A struct, by its index in [`Resolution::structs`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StructId(pub u32);
 
-/// What a name refers to once resolved.
+/// What a name refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Res {
-    /// A parameter or `let` binding, identified by its definition's [`NodeId`].
+    /// A parameter or `let`, by its definition's [`NodeId`].
     Local(NodeId),
-    /// A user-declared function.
     Fn(FnId),
-    /// A top-level constant.
     Const(ConstId),
-    /// A compiler builtin.
     Builtin(Builtin),
 }
 
-/// Mutability and provenance of a local binding, recorded at its definition.
+/// A local binding's name, mutability, and definition span.
 #[derive(Clone, Debug)]
 pub struct LocalInfo {
     pub name: String,
@@ -61,97 +45,72 @@ pub struct LocalInfo {
     pub span: Span,
 }
 
-/// The global table of user functions.
-#[derive(Debug, Default)]
-pub struct FunctionTable {
-    by_name: HashMap<String, FnId>,
-    /// `FnId` index → position of the item in [`Ast::items`].
+/// A dense id that indexes an [`ItemTable`].
+pub trait ItemId: Copy {
+    fn from_index(index: usize) -> Self;
+    fn index(self) -> usize;
+}
+
+impl ItemId for FnId {
+    fn from_index(index: usize) -> Self {
+        FnId(index as u32)
+    }
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl ItemId for ConstId {
+    fn from_index(index: usize) -> Self {
+        ConstId(index as u32)
+    }
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl ItemId for StructId {
+    fn from_index(index: usize) -> Self {
+        StructId(index as u32)
+    }
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// The top-level items of one kind, by name and by dense id.
+#[derive(Debug)]
+pub struct ItemTable<Id> {
+    by_name: HashMap<String, Id>,
+    /// Id → index of the item in [`Ast::items`].
     item_index: Vec<usize>,
 }
 
-impl FunctionTable {
-    /// The [`FnId`] a name binds to, if any.
-    pub fn lookup(&self, name: &str) -> Option<FnId> {
+/// The user functions, by [`FnId`].
+pub type FunctionTable = ItemTable<FnId>;
+/// The constants, by [`ConstId`].
+pub type ConstTable = ItemTable<ConstId>;
+/// The structs, by [`StructId`].
+pub type StructTable = ItemTable<StructId>;
+
+impl<Id> Default for ItemTable<Id> {
+    fn default() -> Self {
+        ItemTable {
+            by_name: HashMap::new(),
+            item_index: Vec::new(),
+        }
+    }
+}
+
+impl<Id: ItemId> ItemTable<Id> {
+    /// The id `name` binds to, if any.
+    pub fn lookup(&self, name: &str) -> Option<Id> {
         self.by_name.get(name).copied()
     }
 
-    /// The `Ast::items` index of a function.
-    pub fn item_index(&self, id: FnId) -> usize {
-        self.item_index[id.0 as usize]
-    }
-
-    /// Number of registered functions.
-    pub fn len(&self) -> usize {
-        self.item_index.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.item_index.is_empty()
-    }
-
-    /// Iterates `(FnId, item index)` pairs in declaration order.
-    pub fn iter(&self) -> impl Iterator<Item = (FnId, usize)> + '_ {
-        self.item_index
-            .iter()
-            .enumerate()
-            .map(|(i, &idx)| (FnId(i as u32), idx))
-    }
-}
-
-/// The global table of top-level constants.
-#[derive(Debug, Default)]
-pub struct ConstTable {
-    by_name: HashMap<String, ConstId>,
-    /// `ConstId` index → position of the item in [`Ast::items`].
-    item_index: Vec<usize>,
-}
-
-impl ConstTable {
-    /// The [`ConstId`] a name binds to, if any.
-    pub fn lookup(&self, name: &str) -> Option<ConstId> {
-        self.by_name.get(name).copied()
-    }
-
-    /// The `Ast::items` index of a constant.
-    pub fn item_index(&self, id: ConstId) -> usize {
-        self.item_index[id.0 as usize]
-    }
-
-    /// Number of registered constants.
-    pub fn len(&self) -> usize {
-        self.item_index.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.item_index.is_empty()
-    }
-
-    /// Iterates `(ConstId, item index)` pairs in declaration order.
-    pub fn iter(&self) -> impl Iterator<Item = (ConstId, usize)> + '_ {
-        self.item_index
-            .iter()
-            .enumerate()
-            .map(|(i, &idx)| (ConstId(i as u32), idx))
-    }
-}
-
-/// The global table of declared structs.
-#[derive(Debug, Default)]
-pub struct StructTable {
-    by_name: HashMap<String, StructId>,
-    /// `StructId` index → position of the item in [`Ast::items`].
-    item_index: Vec<usize>,
-}
-
-impl StructTable {
-    /// The [`StructId`] a name binds to, if any.
-    pub fn lookup(&self, name: &str) -> Option<StructId> {
-        self.by_name.get(name).copied()
-    }
-
-    /// The `Ast::items` index of a struct.
-    pub fn item_index(&self, id: StructId) -> usize {
-        self.item_index[id.0 as usize]
+    /// The [`Ast::items`] index of `id`.
+    pub fn item_index(&self, id: Id) -> usize {
+        self.item_index[id.index()]
     }
 
     pub fn len(&self) -> usize {
@@ -162,16 +121,28 @@ impl StructTable {
         self.item_index.is_empty()
     }
 
-    /// Iterates `(StructId, item index)` pairs in declaration order.
-    pub fn iter(&self) -> impl Iterator<Item = (StructId, usize)> + '_ {
+    /// `(id, item index)` pairs in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = (Id, usize)> + '_ {
         self.item_index
             .iter()
             .enumerate()
-            .map(|(i, &idx)| (StructId(i as u32), idx))
+            .map(|(i, &idx)| (Id::from_index(i), idx))
+    }
+
+    /// Registers `name` for the item at `item_index` under the next id.
+    fn insert(&mut self, name: String, item_index: usize) {
+        let id = Id::from_index(self.item_index.len());
+        self.item_index.push(item_index);
+        self.by_name.insert(name, id);
+    }
+
+    /// Every registered name, in no particular order.
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(String::as_str)
     }
 }
 
-/// The product of resolution: the side tables later phases consume.
+/// Resolution's output: the side tables later phases read.
 #[derive(Debug, Default)]
 pub struct Resolution {
     pub uses: HashMap<NodeId, Res>,
@@ -182,18 +153,19 @@ pub struct Resolution {
 }
 
 impl Resolution {
-    /// The resolution of a `Name` expression, by its node id.
+    /// What the `Name` expression `id` refers to.
     pub fn use_of(&self, id: NodeId) -> Option<Res> {
         self.uses.get(&id).copied()
     }
 
-    /// The binding info for a definition node (`let`/param), by its node id.
+    /// The binding defined by `id` (a `let`, parameter, or loop variable).
     pub fn local(&self, id: NodeId) -> Option<&LocalInfo> {
         self.locals.get(&id)
     }
 }
 
-/// Resolves all names in `ast`, reporting unresolved/duplicate names to `diags`.
+/// Resolves every name in `ast`, reporting unresolved and duplicate names to
+/// `diags`.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve(ast: &Ast, diags: &mut Diagnostics) -> Resolution {
     let mut resolver = Resolver {
@@ -206,8 +178,8 @@ pub fn resolve(ast: &Ast, diags: &mut Diagnostics) -> Resolution {
         match &item.kind {
             ItemKind::Fn(decl) => resolver.resolve_fn(decl),
             ItemKind::Const(decl) => resolver.resolve_const(decl),
-            // Struct field types are resolved during type checking; nothing in a
-            // struct declaration refers to a value name.
+            // Field types are resolved by the type checker; a struct declaration
+            // names no values.
             ItemKind::Struct(_) => {}
         }
     }
@@ -220,7 +192,7 @@ pub fn resolve(ast: &Ast, diags: &mut Diagnostics) -> Resolution {
     resolver.res
 }
 
-/// A single lexical scope: local name → its definition node.
+/// One lexical scope: local name → definition.
 type Scope = HashMap<String, NodeId>;
 
 struct Resolver<'a> {
@@ -230,59 +202,46 @@ struct Resolver<'a> {
 }
 
 impl Resolver<'_> {
-    /// First pass: register every top-level name (functions and constants) so
-    /// later items can refer to earlier and later ones. Functions and constants
-    /// share one namespace; any duplicate keeps the first and reports the rest.
+    /// Registers every top-level name. They share one namespace; a duplicate is
+    /// reported and the first definition kept.
     fn collect_globals(&mut self, ast: &Ast) {
-        // Name → span of its first definition, across both kinds.
+        // Name → span of its first definition.
         let mut seen: HashMap<String, Span> = HashMap::new();
         for (idx, item) in ast.items.iter().enumerate() {
-            let (name, name_span) = match &item.kind {
-                ItemKind::Fn(decl) => (decl.name.name.clone(), decl.name.span),
-                ItemKind::Const(decl) => (decl.name.name.clone(), decl.name.span),
-                ItemKind::Struct(decl) => (decl.name.name.clone(), decl.name.span),
+            let ident = match &item.kind {
+                ItemKind::Fn(decl) => &decl.name,
+                ItemKind::Const(decl) => &decl.name,
+                ItemKind::Struct(decl) => &decl.name,
             };
+            let name = ident.name.clone();
             if let Some(&first) = seen.get(&name) {
                 self.diags.emit(
                     Diagnostic::error(
                         DiagCode::DuplicateDefinition,
                         format!("`{name}` is defined multiple times"),
                     )
-                    .with_primary(name_span, "redefined here")
+                    .with_primary(ident.span, "redefined here")
                     .with_label(first, "first defined here"),
                 );
                 continue;
             }
-            seen.insert(name.clone(), name_span);
+            seen.insert(name.clone(), ident.span);
             match &item.kind {
-                ItemKind::Fn(_) => {
-                    let id = FnId(self.res.functions.item_index.len() as u32);
-                    self.res.functions.item_index.push(idx);
-                    self.res.functions.by_name.insert(name, id);
-                }
-                ItemKind::Const(_) => {
-                    let id = ConstId(self.res.consts.item_index.len() as u32);
-                    self.res.consts.item_index.push(idx);
-                    self.res.consts.by_name.insert(name, id);
-                }
-                ItemKind::Struct(_) => {
-                    let id = StructId(self.res.structs.item_index.len() as u32);
-                    self.res.structs.item_index.push(idx);
-                    self.res.structs.by_name.insert(name, id);
-                }
+                ItemKind::Fn(_) => self.res.functions.insert(name, idx),
+                ItemKind::Const(_) => self.res.consts.insert(name, idx),
+                ItemKind::Struct(_) => self.res.structs.insert(name, idx),
             }
         }
     }
 
-    /// Resolves a constant's initialiser. Constants live in the global scope, so
-    /// the initialiser sees no locals - only other globals.
+    /// Resolves a constant's initialiser, which sees only globals.
     fn resolve_const(&mut self, decl: &ConstDecl) {
         self.resolve_expr(&decl.value);
     }
 
     fn resolve_fn(&mut self, decl: &FnDecl) {
         self.push_scope();
-        // Parameters share one scope; duplicates are an error (not shadowing).
+        // Parameters share one scope, and may not repeat.
         let mut seen: HashMap<&str, Span> = HashMap::new();
         for param in &decl.params {
             if let Some(&first) = seen.get(param.name.name.as_str()) {
@@ -299,7 +258,6 @@ impl Resolver<'_> {
             }
             self.declare(param.id, &param.name.name, false, param.name.span);
         }
-        // The body's own block scope nests inside the parameter scope.
         self.resolve_block(&decl.body);
         self.pop_scope();
     }
@@ -318,8 +276,7 @@ impl Resolver<'_> {
     fn resolve_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Let(l) => {
-                // Resolve the initialiser first, then bring the name into scope,
-                // so the initialiser cannot see the binding it defines.
+                // The initialiser cannot see the binding it defines.
                 self.resolve_expr(&l.init);
                 self.declare(l.id, &l.name.name, l.mutable, l.name.span);
             }
@@ -334,36 +291,47 @@ impl Resolver<'_> {
                 self.resolve_block(&w.body);
             }
             StmtKind::For(f) => {
-                // The range bounds are resolved in the outer scope; the loop
-                // variable is then introduced for the body only.
                 self.resolve_expr(&f.start);
                 self.resolve_expr(&f.end);
-                self.push_scope();
-                self.declare(f.id, &f.var.name, false, f.var.span);
-                self.resolve_block(&f.body);
-                self.pop_scope();
+                self.resolve_loop_body(f.id, &f.var, &f.body);
             }
             StmtKind::ForEach(f) => {
-                // The array is resolved in the outer scope; the element variable
-                // is then introduced for the body only.
                 self.resolve_expr(&f.iterable);
-                self.push_scope();
-                self.declare(f.id, &f.var.name, false, f.var.span);
-                self.resolve_block(&f.body);
-                self.pop_scope();
+                self.resolve_loop_body(f.id, &f.var, &f.body);
             }
             StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
+    /// Resolves a `for` body in a new scope holding the loop variable.
+    fn resolve_loop_body(&mut self, var_id: NodeId, var: &Ident, body: &Block) {
+        self.push_scope();
+        self.declare(var_id, &var.name, false, var.span);
+        self.resolve_block(body);
+        self.pop_scope();
+    }
+
     fn resolve_expr(&mut self, expr: &Expr) {
+        // Struct and field names are checked by the type checker, not here.
         match &expr.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => {}
             ExprKind::Name(name) => self.resolve_name(expr.id, name, expr.span),
-            ExprKind::Unary { rhs, .. } => self.resolve_expr(rhs),
-            ExprKind::Binary { lhs, rhs, .. } => {
-                self.resolve_expr(lhs);
-                self.resolve_expr(rhs);
+            ExprKind::Unary { rhs: e, .. }
+            | ExprKind::Field { base: e, .. }
+            | ExprKind::TupleIndex { base: e, .. } => self.resolve_expr(e),
+            ExprKind::Binary { lhs: a, rhs: b, .. }
+            | ExprKind::Assign {
+                target: a,
+                value: b,
+            }
+            | ExprKind::AssignOp {
+                target: a,
+                value: b,
+                ..
+            }
+            | ExprKind::Index { base: a, index: b } => {
+                self.resolve_expr(a);
+                self.resolve_expr(b);
             }
             ExprKind::Call { callee, args } => {
                 self.resolve_expr(callee);
@@ -371,41 +339,16 @@ impl Resolver<'_> {
                     self.resolve_expr(arg);
                 }
             }
-            ExprKind::Assign { target, value } => {
-                self.resolve_expr(target);
-                self.resolve_expr(value);
-            }
-            ExprKind::AssignOp { target, value, .. } => {
-                self.resolve_expr(target);
-                self.resolve_expr(value);
-            }
-            ExprKind::ArrayLit(elems) => {
+            ExprKind::ArrayLit(elems) | ExprKind::TupleLit(elems) => {
                 for e in elems {
                     self.resolve_expr(e);
                 }
             }
-            ExprKind::Index { base, index } => {
-                self.resolve_expr(base);
-                self.resolve_expr(index);
-            }
             ExprKind::StructLit { fields, .. } => {
-                // The struct name is checked against the struct table during
-                // type checking; here we resolve the field value expressions.
                 for field in fields {
                     self.resolve_expr(&field.value);
                 }
             }
-            ExprKind::Field { base, .. } => {
-                // The field name is resolved against the struct's declaration
-                // during type checking.
-                self.resolve_expr(base);
-            }
-            ExprKind::TupleLit(elems) => {
-                for e in elems {
-                    self.resolve_expr(e);
-                }
-            }
-            ExprKind::TupleIndex { base, .. } => self.resolve_expr(base),
             ExprKind::If(if_expr) => {
                 self.resolve_expr(&if_expr.cond);
                 self.resolve_block(&if_expr.then_branch);
@@ -415,7 +358,7 @@ impl Resolver<'_> {
             }
             ExprKind::Match(m) => {
                 self.resolve_expr(&m.scrutinee);
-                // Patterns are literals, so they bind nothing; resolve bodies.
+                // Patterns are literals and bind nothing.
                 for arm in &m.arms {
                     self.resolve_expr(&arm.body);
                 }
@@ -424,7 +367,8 @@ impl Resolver<'_> {
         }
     }
 
-    /// Resolves a single name use against locals, then functions, then builtins.
+    /// Resolves a name use: locals first, then functions, constants, and
+    /// builtins.
     fn resolve_name(&mut self, use_id: NodeId, name: &str, span: Span) {
         if let Some(def) = self.lookup_local(name) {
             self.res.uses.insert(use_id, Res::Local(def));
@@ -447,15 +391,14 @@ impl Resolver<'_> {
         }
     }
 
-    /// Suggests the in-scope name closest to `name` (locals, functions,
-    /// constants, builtins), for a "did you mean …?" help line.
+    /// The visible name closest to `name`, for a "did you mean" hint.
     fn suggest_name(&self, name: &str) -> Option<String> {
         let mut candidates: Vec<&str> = Vec::new();
         for scope in &self.scopes {
             candidates.extend(scope.keys().map(String::as_str));
         }
-        candidates.extend(self.res.functions.by_name.keys().map(String::as_str));
-        candidates.extend(self.res.consts.by_name.keys().map(String::as_str));
+        candidates.extend(self.res.functions.names());
+        candidates.extend(self.res.consts.names());
         candidates.extend(Builtin::ALL.iter().map(|b| b.name()));
         candidates.sort_unstable();
         candidates.dedup();
@@ -472,7 +415,7 @@ impl Resolver<'_> {
         self.scopes.pop();
     }
 
-    /// Introduces a binding in the innermost scope and records its info.
+    /// Binds `name` to `def` in the innermost scope and records the binding.
     fn declare(&mut self, def: NodeId, name: &str, mutable: bool, span: Span) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.to_string(), def);
@@ -487,7 +430,7 @@ impl Resolver<'_> {
         );
     }
 
-    /// Finds the nearest enclosing definition of `name`.
+    /// The innermost binding of `name`.
     fn lookup_local(&self, name: &str) -> Option<NodeId> {
         self.scopes
             .iter()

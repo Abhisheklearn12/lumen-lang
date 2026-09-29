@@ -1,19 +1,12 @@
-//! Code generation: [`Hir`] → [`Program`] bytecode.
+//! Code generation: [`Hir`] to bytecode.
 //!
-//! # The stack-discipline invariant
+//! One invariant keeps it local: an expression's code pushes exactly one value
+//! net, and a statement's code pushes none. So a block is its statements then
+//! its tail (or `unit`), both arms of an `if` leave one value, and a call
+//! leaves its result.
 //!
-//! Every expression compiles to a sequence of instructions that **net-pushes
-//! exactly one value**; every statement net-pushes **zero**. This single rule
-//! makes the generator local and obviously correct: a block evaluates its
-//! statements (each balanced) and then its tail (or a `unit`) for the block's
-//! value; an `if` arranges for both arms to leave one value; a call pushes its
-//! arguments then a result. The VM relies on the same discipline.
-//!
-//! Because HIR is typed, operator instructions are chosen monomorphically from
-//! the operand type, so no type information survives into the VM.
-//!
-//! Jumps are emitted with a placeholder target and **backpatched** once the
-//! destination index is known.
+//! Operators are picked by operand type, so the VM never checks types. Forward
+//! jumps are emitted with a placeholder target and patched once it is known.
 
 use std::rc::Rc;
 
@@ -21,7 +14,7 @@ use crate::backend::bytecode::{Chunk, Op, Program};
 use crate::hir::{BinOp, Block, Callee, Expr, ExprKind, Function, Hir, LocalId, Stmt, UnOp};
 use crate::sema::types::{Builtin, Type};
 
-/// Compiles a lowered, optimized program to bytecode.
+/// Compiles a program to bytecode.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn generate(hir: &Hir) -> Program {
     let functions = hir.functions.iter().map(compile_function).collect();
@@ -38,7 +31,7 @@ fn compile_function(func: &Function) -> Chunk {
         consts: Vec::new(),
         loops: Vec::new(),
     };
-    // The body leaves one value (its block value); return it.
+    // The body leaves its value on the stack.
     c.block_value(&func.body);
     c.emit(Op::Return);
     Chunk {
@@ -50,22 +43,19 @@ fn compile_function(func: &Function) -> Chunk {
     }
 }
 
-/// Tracks the unresolved jumps for one enclosing loop, so `break` and
-/// `continue` can be backpatched once the loop's exit and increment points are
-/// known.
+/// The `break` and `continue` jumps of a loop, patched when the loop ends.
 #[derive(Default)]
 struct LoopCtx {
-    /// `break` jumps, patched to the instruction after the loop.
+    /// Patched to just after the loop.
     break_jumps: Vec<usize>,
-    /// `continue` jumps, patched to the loop's continuation point (the
-    /// condition for `while`, the increment for `for`).
+    /// Patched to the condition (`while`) or the increment (`for`).
     continue_jumps: Vec<usize>,
 }
 
 struct FnCompiler {
     code: Vec<Op>,
     consts: Vec<Rc<str>>,
-    /// Stack of enclosing loops; the innermost is last.
+    /// Enclosing loops, innermost last.
     loops: Vec<LoopCtx>,
 }
 
@@ -75,7 +65,7 @@ impl FnCompiler {
         self.code.len() - 1
     }
 
-    /// Interns a string constant and returns its pool index.
+    /// The pool index of string `s`, added if new.
     fn intern(&mut self, s: &str) -> u32 {
         if let Some(idx) = self.consts.iter().position(|c| &**c == s) {
             return idx as u32;
@@ -84,18 +74,22 @@ impl FnCompiler {
         (self.consts.len() - 1) as u32
     }
 
-    /// Sets the absolute target of a previously emitted jump.
-    fn patch_to_here(&mut self, jump_idx: usize) {
-        let target = self.code.len();
-        match &mut self.code[jump_idx] {
-            Op::Jump(t) | Op::JumpIfFalse(t) => *t = target,
-            other => unreachable!("patching non-jump op: {other:?}"),
+    /// Points the jump at `jump` to `target`.
+    fn patch(&mut self, jump: usize, target: usize) {
+        match self.code[jump].jump_target_mut() {
+            Some(t) => *t = target,
+            None => unreachable!("patching non-jump op: {:?}", self.code[jump]),
         }
+    }
+
+    /// Points the jump at `jump` to the next instruction emitted.
+    fn patch_to_here(&mut self, jump: usize) {
+        self.patch(jump, self.code.len());
     }
 
     // ---- blocks & statements ----
 
-    /// Compiles a block in value position: net stack effect `+1`.
+    /// Compiles a block for its value: pushes one value.
     fn block_value(&mut self, block: &Block) {
         for stmt in &block.stmts {
             self.stmt(stmt);
@@ -108,7 +102,7 @@ impl FnCompiler {
         }
     }
 
-    /// Compiles a statement: net stack effect `0`.
+    /// Compiles a statement: pushes nothing.
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { local, value } => {
@@ -146,20 +140,14 @@ impl FnCompiler {
         self.expr(cond);
         let exit = self.emit(Op::JumpIfFalse(usize::MAX));
         self.loops.push(LoopCtx::default());
-        // The body is a block in value position; its value is discarded.
         self.block_value(body);
         self.emit(Op::Pop);
         self.emit(Op::Jump(cond_start));
-        let ctx = self.loops.pop().unwrap_or_default();
-        // `break` leaves the loop; `continue` re-tests the condition.
-        self.patch_to_here(exit);
-        let end = self.code.len();
-        self.patch_all(&ctx.break_jumps, end);
-        self.patch_all(&ctx.continue_jumps, cond_start);
+        self.finish_loop(exit, cond_start);
     }
 
-    /// `for var in start..end { body }`: initialise `var` and the cached bound,
-    /// then loop with the increment as the `continue` target.
+    /// Compiles `for var in start..end`, with the increment as the `continue`
+    /// target.
     fn for_loop(&mut self, var: LocalId, end_var: LocalId, start: &Expr, end: &Expr, body: &Block) {
         self.expr(start);
         self.emit(Op::StoreLocal(var.0));
@@ -176,24 +164,31 @@ impl FnCompiler {
         self.block_value(body);
         self.emit(Op::Pop);
 
-        // Increment point - also where `continue` lands.
         let incr = self.code.len();
         self.emit(Op::LoadLocal(var.0));
         self.emit(Op::PushInt(1));
         self.emit(Op::AddInt);
         self.emit(Op::StoreLocal(var.0));
         self.emit(Op::Jump(cond_start));
-
-        let ctx = self.loops.pop().unwrap_or_default();
-        self.patch_to_here(exit);
-        let end_label = self.code.len();
-        self.patch_all(&ctx.break_jumps, end_label);
-        self.patch_all(&ctx.continue_jumps, incr);
+        self.finish_loop(exit, incr);
     }
 
-    /// Emits a `break` (`is_break`) or `continue` jump, recording it for
-    /// backpatching by the enclosing loop. Outside a loop it is a no-op (the
-    /// type checker already reported the error).
+    /// Ends the innermost loop: its exit test and `break`s jump here, and its
+    /// `continue`s to `continue_target`.
+    fn finish_loop(&mut self, exit: usize, continue_target: usize) {
+        let ctx = self.loops.pop().unwrap_or_default();
+        self.patch_to_here(exit);
+        let end = self.code.len();
+        for &jump in &ctx.break_jumps {
+            self.patch(jump, end);
+        }
+        for &jump in &ctx.continue_jumps {
+            self.patch(jump, continue_target);
+        }
+    }
+
+    /// Emits a `break` (`is_break`) or `continue` jump for the innermost loop to
+    /// patch. Outside a loop, which type checking rejects, it is never patched.
     fn loop_jump(&mut self, is_break: bool) {
         let idx = self.emit(Op::Jump(usize::MAX));
         if let Some(ctx) = self.loops.last_mut() {
@@ -205,17 +200,7 @@ impl FnCompiler {
         }
     }
 
-    /// Patches every jump in `jumps` to `target`.
-    fn patch_all(&mut self, jumps: &[usize], target: usize) {
-        for &idx in jumps {
-            match &mut self.code[idx] {
-                Op::Jump(t) | Op::JumpIfFalse(t) => *t = target,
-                other => unreachable!("patching non-jump op: {other:?}"),
-            }
-        }
-    }
-
-    // ---- expressions (each nets +1) ----
+    // ---- expressions: each pushes one value ----
 
     fn expr(&mut self, expr: &Expr) {
         match &expr.kind {
@@ -241,10 +226,10 @@ impl FnCompiler {
             ExprKind::Assign { local, value } => {
                 self.expr(value);
                 self.emit(Op::StoreLocal(local.0));
-                // Assignment evaluates to unit, preserving the +1 invariant.
                 self.emit(Op::PushUnit);
             }
-            ExprKind::ArrayLit(elems) => {
+            // A struct is an array of its fields.
+            ExprKind::ArrayLit(elems) | ExprKind::StructLit(elems) => {
                 for e in elems {
                     self.expr(e);
                 }
@@ -259,16 +244,7 @@ impl FnCompiler {
                 self.expr(base);
                 self.expr(index);
                 self.expr(value);
-                // SetIndex consumes the three operands and leaves unit.
                 self.emit(Op::SetIndex);
-            }
-            // A struct is laid out as a fixed array of field values, so struct
-            // construction and field access reuse the array opcodes.
-            ExprKind::StructLit(fields) => {
-                for f in fields {
-                    self.expr(f);
-                }
-                self.emit(Op::MakeArray(fields.len() as u32));
             }
             ExprKind::GetField { base, idx } => {
                 self.expr(base);
@@ -301,7 +277,7 @@ impl FnCompiler {
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) {
-        // Logical operators short-circuit and so compile to control flow.
+        // `&&` and `||` short-circuit, so they compile to jumps.
         match op {
             BinOp::And => return self.logical_and(lhs, rhs),
             BinOp::Or => return self.logical_or(lhs, rhs),
@@ -309,7 +285,6 @@ impl FnCompiler {
         }
         self.expr(lhs);
         self.expr(rhs);
-        // `+` on strings is concatenation, not arithmetic.
         let instr = if op == BinOp::Add && lhs.ty == Type::Str {
             Op::ConcatStr
         } else {
@@ -318,7 +293,7 @@ impl FnCompiler {
         self.emit(instr);
     }
 
-    /// `a && b`: if `a` is false, the result is false and `b` is not evaluated.
+    /// `a && b`: `false` without evaluating `b` if `a` is false.
     fn logical_and(&mut self, lhs: &Expr, rhs: &Expr) {
         self.expr(lhs);
         let to_false = self.emit(Op::JumpIfFalse(usize::MAX));
@@ -329,11 +304,10 @@ impl FnCompiler {
         self.patch_to_here(end);
     }
 
-    /// `a || b`: if `a` is true, the result is true and `b` is not evaluated.
+    /// `a || b`: `true` without evaluating `b` if `a` is true.
     fn logical_or(&mut self, lhs: &Expr, rhs: &Expr) {
         self.expr(lhs);
         let eval_rhs = self.emit(Op::JumpIfFalse(usize::MAX));
-        // `a` was true: result is true.
         self.emit(Op::PushBool(true));
         let end = self.emit(Op::Jump(usize::MAX));
         self.patch_to_here(eval_rhs);
@@ -353,14 +327,11 @@ impl FnCompiler {
                     argc,
                 });
             }
-            // `len` maps to a dedicated opcode rather than a builtin dispatch.
+            // `len` and the `array_new_*` family have opcodes of their own.
             Callee::Builtin(Builtin::Len) => {
                 self.emit(Op::ArrayLen);
             }
             Callee::Builtin(builtin) => match builtin.new_array_elem() {
-                // So does each `array_new_*`. Its element type is fixed at
-                // compile time, so it rides along as an immediate and the VM
-                // never has to inspect the value it is filling the array with.
                 Some(elem) => {
                     self.emit(Op::NewArray(elem));
                 }
@@ -379,7 +350,6 @@ impl FnCompiler {
         self.patch_to_here(to_else);
         match else_branch {
             Some(else_expr) => self.expr(else_expr),
-            // No else: the `if` yields unit.
             None => {
                 self.emit(Op::PushUnit);
             }
@@ -388,8 +358,8 @@ impl FnCompiler {
     }
 }
 
-/// Selects the arithmetic/comparison instruction for an operator and operand
-/// type. Equality is type-agnostic; ordering and arithmetic are monomorphic.
+/// The instruction for `op` on operands of type `operand`: the float variant
+/// for `f64`, else the int one. `==` and `!=` work on any type.
 fn arithmetic_op(op: BinOp, operand: Type) -> Op {
     let is_float = matches!(operand, Type::Float);
     match op {
@@ -413,7 +383,6 @@ fn arithmetic_op(op: BinOp, operand: Type) -> Op {
         BinOp::Ge => Op::GeInt,
         BinOp::Eq => Op::Eq,
         BinOp::Ne => Op::Ne,
-        // Logical operators are handled before reaching here.
         BinOp::And | BinOp::Or => unreachable!("logical ops compile to control flow"),
     }
 }

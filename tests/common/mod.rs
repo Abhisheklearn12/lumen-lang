@@ -1,11 +1,7 @@
-//! Shared helpers for the integration and regression test suites.
-//!
-//! These drive the compiler exactly as the CLI does  through the public
-//! [`Session`] API plus the VM  so the tests exercise the same path real users
-//! take, not internal shortcuts.
+//! Helpers shared by the integration tests. They compile through the public
+//! [`Session`] API and run on the VM, as the CLI does.
 
-// Each test binary includes this whole module but uses only part of it, so some
-// helpers are unused per-crate. This is the standard `tests/common` situation.
+// Each test binary uses only some of these helpers.
 #![allow(dead_code)]
 
 use lumen::backend::{VmError, execute};

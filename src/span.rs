@@ -1,44 +1,34 @@
-//! Source positions and spans.
+//! Byte spans into the source file.
 //!
-//! A [`Span`] is a half-open byte range `[lo, hi)` into a single
-//! [`SourceFile`](crate::source::SourceFile). Lumen compiles one root file per
-//! invocation (the language has no module/import system), so spans do not need
-//! to carry a file id  the active file is known to the [`Session`].
-//!
-//! Byte offsets are stored as `u32`. A 4 GiB source-file limit is more than
-//! sufficient and halves the size of `Span` compared to `usize`, which matters
-//! because spans are embedded in every AST and HIR node.
+//! A compilation has exactly one source file (Lumen has no modules), so a
+//! [`Span`] needs no file id. Offsets are `u32`: 4 GiB of source is plenty, and
+//! it keeps `Span` at 8 bytes, which matters because every AST and HIR node
+//! carries one.
 
 use std::fmt;
 
-/// A half-open byte range `[lo, hi)` into the source file.
-///
-/// Spans are cheap (`Copy`, 8 bytes) and are attached to virtually every
-/// compiler artifact so diagnostics can point back at the originating source.
+/// A half-open byte range `[lo, hi)`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
-    /// Inclusive start byte offset.
+    /// Inclusive start offset.
     pub lo: u32,
-    /// Exclusive end byte offset.
+    /// Exclusive end offset.
     pub hi: u32,
 }
 
 impl Span {
-    /// Creates a span from raw byte offsets.
-    ///
-    /// `lo` must not exceed `hi`; this is debug-asserted because an inverted
-    /// span signals a bug in a phase that constructs it.
+    /// Creates a span. An inverted range is a compiler bug, so it is
+    /// debug-asserted.
     #[inline]
     pub fn new(lo: u32, hi: u32) -> Span {
         debug_assert!(lo <= hi, "inverted span: {lo}..{hi}");
         Span { lo, hi }
     }
 
-    /// A zero-length sentinel span, used where a real location is unavailable
-    /// (e.g. compiler-synthesised nodes). Never points into real source text.
+    /// An empty span at offset 0, for nodes with no real source location.
     pub const DUMMY: Span = Span { lo: 0, hi: 0 };
 
-    /// The number of bytes covered by the span.
+    /// Length in bytes.
     #[inline]
     pub fn len(&self) -> u32 {
         self.hi - self.lo
@@ -50,25 +40,25 @@ impl Span {
         self.lo == self.hi
     }
 
-    /// Returns the smallest span covering both `self` and `other`.
+    /// The smallest span covering both `self` and `other`.
     #[inline]
     pub fn to(self, other: Span) -> Span {
         Span::new(self.lo.min(other.lo), self.hi.max(other.hi))
     }
 
-    /// A zero-length span pointing at the start of `self`.
+    /// The empty span at `self.lo`.
     #[inline]
     pub fn shrink_to_lo(self) -> Span {
         Span::new(self.lo, self.lo)
     }
 
-    /// A zero-length span pointing at the end of `self`.
+    /// The empty span at `self.hi`.
     #[inline]
     pub fn shrink_to_hi(self) -> Span {
         Span::new(self.hi, self.hi)
     }
 
-    /// The byte range as a `usize` pair, for slicing into source text.
+    /// The span as a `usize` range, for slicing source text.
     #[inline]
     pub fn range(&self) -> std::ops::Range<usize> {
         self.lo as usize..self.hi as usize
@@ -81,10 +71,7 @@ impl fmt::Debug for Span {
     }
 }
 
-/// A value paired with its source span.
-///
-/// Used where a node is otherwise just data (e.g. an identifier string) but
-/// still needs a location for diagnostics.
+/// A value paired with the span it came from.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Spanned<T> {
     pub node: T,
@@ -97,7 +84,7 @@ impl<T> Spanned<T> {
         Spanned { node, span }
     }
 
-    /// Applies `f` to the contained value, preserving the span.
+    /// Maps the value, keeping the span.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {
         Spanned {
             node: f(self.node),

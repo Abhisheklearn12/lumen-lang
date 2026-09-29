@@ -1,29 +1,16 @@
-//! Type checking: assigns a [`Type`] to every expression and binding, and
-//! verifies the program is well-typed.
+//! Type checking: gives every expression and binding a [`Type`] and reports
+//! ill-typed code.
 //!
-//! # Design
+//! It runs after [resolution](mod@super::resolve), so every name already points
+//! at its definition. Types are inferred bottom-up; annotations, arguments,
+//! conditions, and `return` values are then checked against what they must be.
+//! There are no implicit conversions: `i64` and `f64` never mix.
 //!
-//! The checker runs after [resolution](super::resolve), so every name already
-//! points at a definition. It is a straightforward bidirectional-ish walk:
-//! expressions are *synthesised* bottom-up, and a handful of positions
-//! (`let` annotations, `return`, call arguments, conditions) *check* a
-//! synthesised type against an expected one.
-//!
-//! Lumen has no implicit conversions: `i64` and `f64` never mix, and operators
-//! require matching operand types. This keeps the rules  and their
-//! diagnostics  simple and predictable.
-//!
-//! Like every phase, it reports as much as it can: a type error yields a
-//! diagnostic and a [`Type::Error`] result, which is compatible with everything
-//! and so suppresses cascading errors.
-//!
-//! # Output
-//!
-//! A [`Typeck`] of side tables: `expr_types` (per expression), `local_types`
-//! (per `let`/parameter definition), and `signatures` (per [`FnId`]). HIR
-//! lowering reads these to build its fully-typed tree.
+//! An ill-typed expression gets [`Type::Error`], which is compatible with
+//! everything, so each mistake is reported once. The result is a [`Typeck`] of
+//! side tables that HIR lowering reads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, Diagnostics};
 use crate::errors::DiagCode;
@@ -32,16 +19,16 @@ use crate::sema::resolve::{ConstId, FnId, Res, Resolution, StructId};
 use crate::sema::types::{Builtin, Elem, Type};
 use crate::span::Span;
 
-/// The resolved layout of a declared struct: its name and ordered fields.
+/// A struct's name and fields.
 #[derive(Clone, Debug)]
 pub struct StructInfo {
     pub name: String,
-    /// Fields in declaration order, paired with their resolved types.
+    /// Fields and their types, in declaration order.
     pub fields: Vec<(String, Type)>,
 }
 
 impl StructInfo {
-    /// The index and type of a field by name, if it exists.
+    /// The index and type of field `name`, if it exists.
     pub fn field(&self, name: &str) -> Option<(usize, Type)> {
         self.fields
             .iter()
@@ -50,7 +37,7 @@ impl StructInfo {
     }
 }
 
-/// The resolved signature of a user function.
+/// A user function's signature.
 #[derive(Clone, Debug)]
 pub struct FnSig {
     pub name: String,
@@ -58,7 +45,7 @@ pub struct FnSig {
     pub ret: Type,
 }
 
-/// The compile-time value of a top-level constant, inlined at each use.
+/// A constant's compile-time value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConstValue {
     Int(i64),
@@ -68,7 +55,7 @@ pub enum ConstValue {
 }
 
 impl ConstValue {
-    /// The type of this constant value.
+    /// The value's type.
     pub fn ty(&self) -> Type {
         match self {
             ConstValue::Int(_) => Type::Int,
@@ -79,47 +66,46 @@ impl ConstValue {
     }
 }
 
-/// The product of type checking: types for every node, plus signatures.
+/// Type checking's output: side tables keyed by [`NodeId`] or by item id.
 #[derive(Debug, Default)]
 pub struct Typeck {
-    /// Type of each expression, keyed by its [`NodeId`].
+    /// Each expression's type.
     pub expr_types: HashMap<NodeId, Type>,
-    /// Type of each binding, keyed by its definition's [`NodeId`].
+    /// Each binding's type, keyed by its definition.
     pub local_types: HashMap<NodeId, Type>,
-    /// Signatures indexed by [`FnId`].
+    /// Indexed by [`FnId`].
     pub signatures: Vec<FnSig>,
-    /// Declared type of each constant, indexed by [`ConstId`].
+    /// Declared types, indexed by [`ConstId`].
     pub const_types: Vec<Type>,
-    /// Evaluated value of each constant, indexed by [`ConstId`].
+    /// Evaluated values, indexed by [`ConstId`].
     pub const_values: Vec<ConstValue>,
-    /// Layout of each struct, indexed by [`StructId`].
+    /// Indexed by [`StructId`].
     pub structs: Vec<StructInfo>,
-    /// Element types of each interned tuple type, indexed by the `u32` carried
-    /// in [`Type::Tuple`]. Tuple types are structural, so identical element
-    /// lists share one index.
+    /// Element types of each tuple type, indexed by the `u32` in
+    /// [`Type::Tuple`]. Equal element lists share one index.
     pub tuple_types: Vec<Vec<Type>>,
-    /// The `main` entry point, if the program has a valid one.
+    /// The entry point, if the program has a valid `main`.
     pub main: Option<FnId>,
 }
 
 impl Typeck {
-    /// The type assigned to an expression. Defaults to [`Type::Error`] if the
-    /// expression was never typed (only possible on malformed input).
+    /// The type of expression `id`, or [`Type::Error`] if it was never typed
+    /// (possible only in a program with errors).
     pub fn type_of(&self, id: NodeId) -> Type {
         self.expr_types.get(&id).copied().unwrap_or(Type::Error)
     }
 
-    /// The type of a binding (`let`/parameter) by its definition id.
+    /// The type of the binding defined by `id`, or [`Type::Error`].
     pub fn local_type(&self, id: NodeId) -> Type {
         self.local_types.get(&id).copied().unwrap_or(Type::Error)
     }
 
-    /// The signature of a function.
+    /// The signature of function `id`.
     pub fn signature(&self, id: FnId) -> &FnSig {
         &self.signatures[id.0 as usize]
     }
 
-    /// The declared type of a constant.
+    /// The declared type of constant `id`, or [`Type::Error`].
     pub fn const_type(&self, id: ConstId) -> Type {
         self.const_types
             .get(id.0 as usize)
@@ -127,23 +113,23 @@ impl Typeck {
             .unwrap_or(Type::Error)
     }
 
-    /// The evaluated value of a constant.
+    /// The value of constant `id`.
     pub fn const_value(&self, id: ConstId) -> &ConstValue {
         &self.const_values[id.0 as usize]
     }
 
-    /// The layout of a struct.
+    /// The fields of struct `id`.
     pub fn struct_info(&self, id: StructId) -> &StructInfo {
         &self.structs[id.0 as usize]
     }
 
-    /// The element types of an interned tuple type.
+    /// The element types of tuple type `id`.
     pub fn tuple_elems(&self, id: u32) -> &[Type] {
         &self.tuple_types[id as usize]
     }
 
-    /// Interns a tuple type, returning the index identifying it. Structurally
-    /// identical tuples share an index, so [`Type::Tuple`] comparison is correct.
+    /// The index of the tuple type with these elements, added if new, so that
+    /// equal tuple types compare equal.
     fn intern_tuple(&mut self, elems: Vec<Type>) -> u32 {
         if let Some(pos) = self.tuple_types.iter().position(|t| *t == elems) {
             return pos as u32;
@@ -153,7 +139,7 @@ impl Typeck {
     }
 }
 
-/// Type-checks `ast` using the [`Resolution`], reporting type errors to `diags`.
+/// Type-checks `ast`, reporting errors to `diags`.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn check(ast: &Ast, res: &Resolution, diags: &mut Diagnostics) -> Typeck {
     let mut checker = Checker {
@@ -185,17 +171,17 @@ struct Checker<'a> {
     res: &'a Resolution,
     diags: &'a mut Diagnostics,
     tc: Typeck,
-    /// Return type of the function currently being checked.
+    /// The return type of the function being checked.
     cur_ret: Type,
-    /// Nesting depth of enclosing loops, for validating `break`/`continue`.
+    /// How many loops enclose the current code, for `break`/`continue`.
     loop_depth: u32,
 }
 
 impl Checker<'_> {
     // ---- signatures ----
 
-    /// Resolves every function's parameter and return types up front, so that
-    /// calls can be checked regardless of declaration order.
+    /// Records every function's signature before any body is checked, so calls
+    /// may precede declarations.
     fn collect_signatures(&mut self) {
         for (_fn_id, item_idx) in self.res.functions.iter() {
             let ItemKind::Fn(decl) = &self.ast.items[item_idx].kind else {
@@ -223,15 +209,15 @@ impl Checker<'_> {
         }
     }
 
-    /// Resolves the field types of every struct up front, so struct types can
-    /// be named anywhere (including before the struct's own declaration).
+    /// Records every struct's fields up front, so struct types may be named
+    /// before their declaration.
     fn collect_structs(&mut self) {
         for (_id, item_idx) in self.res.structs.iter() {
             let ItemKind::Struct(decl) = &self.ast.items[item_idx].kind else {
                 continue;
             };
             let mut fields = Vec::with_capacity(decl.fields.len());
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut seen: HashSet<&str> = HashSet::new();
             for field in &decl.fields {
                 if !seen.insert(&field.name.name) {
                     self.diags.emit(
@@ -252,8 +238,8 @@ impl Checker<'_> {
         }
     }
 
-    /// Type-checks and evaluates every top-level constant, in declaration order.
-    /// A constant may reference only constants declared before it.
+    /// Checks and evaluates each constant in declaration order; a constant may
+    /// use only constants declared before it.
     fn check_consts(&mut self) {
         for (_const_id, item_idx) in self.res.consts.iter() {
             let ItemKind::Const(decl) = &self.ast.items[item_idx].kind else {
@@ -263,20 +249,17 @@ impl Checker<'_> {
             let value_ty = self.check_expr(&decl.value);
             if !value_ty.compatible(declared) {
                 self.diags.emit(
-                    Diagnostic::error(
-                        DiagCode::TypeMismatch,
+                    mismatch(
                         format!("mismatched types in `const {}`", decl.name.name),
-                    )
-                    .with_primary(
                         decl.value.span,
-                        format!("expected `{declared}`, found `{value_ty}`"),
+                        declared,
+                        value_ty,
                     )
                     .with_label(decl.ty.span, "expected due to this annotation"),
                 );
             }
             let value = self.eval_const(&decl.value).unwrap_or_else(|| {
-                // Only report a separate "not constant" error when the value was
-                // otherwise well-typed (avoids piling onto an existing error).
+                // An ill-typed value has already been reported.
                 if !value_ty.is_error() {
                     self.diags.emit(
                         Diagnostic::error(
@@ -294,8 +277,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Evaluates a constant expression to a [`ConstValue`], or `None` if it is
-    /// not a compile-time constant.
+    /// The value of `expr`, or `None` if it is not a compile-time constant.
     fn eval_const(&self, expr: &Expr) -> Option<ConstValue> {
         match &expr.kind {
             ExprKind::Int(v) => Some(ConstValue::Int(*v)),
@@ -303,7 +285,7 @@ impl Checker<'_> {
             ExprKind::Bool(v) => Some(ConstValue::Bool(*v)),
             ExprKind::Str(s) => Some(ConstValue::Str(s.clone())),
             ExprKind::Name(_) => match self.res.use_of(expr.id) {
-                // A reference to an already-evaluated constant.
+                // Only constants already evaluated, i.e. declared earlier.
                 Some(Res::Const(id)) if (id.0 as usize) < self.tc.const_values.len() => {
                     Some(self.tc.const_values[id.0 as usize].clone())
                 }
@@ -317,8 +299,8 @@ impl Checker<'_> {
         }
     }
 
-    /// Translates a syntactic [`TypeExpr`] to a semantic [`Type`], reporting
-    /// unknown type names.
+    /// The [`Type`] a [`TypeExpr`] denotes, reporting unknown names and invalid
+    /// array element types.
     fn resolve_type(&mut self, ty: &TypeExpr) -> Type {
         match &ty.kind {
             TypeExprKind::Named(name) => {
@@ -368,16 +350,17 @@ impl Checker<'_> {
                 }
                 Type::Tuple(self.tc.intern_tuple(elems))
             }
-            // Already reported by the parser; stay silent.
+            // The parser already reported it.
             TypeExprKind::Error => Type::Error,
         }
     }
 
-    /// Verifies the program has a `main` with signature `fn main()`.
+    /// Checks that the program has a `fn main()` with no parameters returning
+    /// `unit`.
     fn check_main(&mut self) {
         match self.res.functions.lookup("main") {
             Some(id) => {
-                let sig = &self.tc.signatures[id.0 as usize];
+                let sig = self.tc.signature(id);
                 let ok = sig.params.is_empty() && matches!(sig.ret, Type::Unit);
                 if ok {
                     self.tc.main = Some(id);
@@ -404,23 +387,15 @@ impl Checker<'_> {
     // ---- functions / blocks / statements ----
 
     fn check_fn(&mut self, fn_id: FnId, decl: &FnDecl) {
-        self.cur_ret = self.tc.signatures[fn_id.0 as usize].ret;
+        self.cur_ret = self.tc.signature(fn_id).ret;
         let body_ty = self.check_block(&decl.body);
 
-        // If every path through the body ends in an explicit `return`, those
-        // returns were checked individually and there is no fall-through value
-        // to verify here.
-        if block_diverges(&decl.body) {
-            return;
-        }
-
-        // Otherwise control can fall off the end with the body's tail value
-        // (or `unit` if there is no tail), which must match the return type.
-        if body_ty.compatible(self.cur_ret) {
+        // If the body always hits a `return`, each was checked where it stands.
+        // Otherwise the body's value is the return value.
+        if block_diverges(&decl.body) || body_ty.compatible(self.cur_ret) {
             return;
         }
         if matches!(body_ty, Type::Unit) && !matches!(self.cur_ret, Type::Unit) {
-            // Fell off the end of a value-returning function.
             self.diags.emit(
                 Diagnostic::error(
                     DiagCode::MissingReturn,
@@ -455,8 +430,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Checks a block and returns its type (the tail expression's type, or
-    /// `unit` if there is none).
+    /// Checks a block, returning its tail's type (`unit` if none).
     fn check_block(&mut self, block: &Block) -> Type {
         for stmt in &block.stmts {
             self.check_stmt(stmt);
@@ -483,9 +457,7 @@ impl Checker<'_> {
                     DiagCode::NonBoolCondition,
                     "`while` condition",
                 );
-                self.loop_depth += 1;
-                self.check_block(&w.body);
-                self.loop_depth -= 1;
+                self.check_loop_body(&w.body);
             }
             StmtKind::For(f) => self.check_for(f),
             StmtKind::ForEach(f) => self.check_for_each(f),
@@ -494,8 +466,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Checks `for v in array { ... }`: the iterable must be an array, and the
-    /// loop variable takes the array's element type.
+    /// Checks `for v in array`: `v` has the array's element type.
     fn check_for_each(&mut self, f: &ForEachStmt) {
         let iter_ty = self.check_expr(&f.iterable);
         let elem = match iter_ty {
@@ -510,13 +481,11 @@ impl Checker<'_> {
             }
         };
         self.tc.local_types.insert(f.id, elem);
-        self.loop_depth += 1;
-        self.check_block(&f.body);
-        self.loop_depth -= 1;
+        self.check_loop_body(&f.body);
     }
 
+    /// Checks `for v in start..end`: both bounds and `v` are `i64`.
     fn check_for(&mut self, f: &ForStmt) {
-        // Both bounds must be `i64`; the loop variable is then an `i64`.
         let start = self.check_expr(&f.start);
         self.expect(
             start,
@@ -534,12 +503,16 @@ impl Checker<'_> {
             "range end",
         );
         self.tc.local_types.insert(f.id, Type::Int);
+        self.check_loop_body(&f.body);
+    }
+
+    fn check_loop_body(&mut self, body: &Block) {
         self.loop_depth += 1;
-        self.check_block(&f.body);
+        self.check_block(body);
         self.loop_depth -= 1;
     }
 
-    /// Reports `break`/`continue` used outside any loop.
+    /// Reports `break` or `continue` outside a loop.
     fn check_loop_jump(&mut self, kw: &str, span: Span) {
         if self.loop_depth == 0 {
             self.diags.emit(
@@ -559,20 +532,17 @@ impl Checker<'_> {
                 let expected = self.resolve_type(annot);
                 if !init.compatible(expected) {
                     self.diags.emit(
-                        Diagnostic::error(
-                            DiagCode::TypeMismatch,
+                        mismatch(
                             format!("mismatched types in `let {}`", l.name.name),
-                        )
-                        .with_primary(
                             l.init.span,
-                            format!("expected `{expected}`, found `{init}`"),
+                            expected,
+                            init,
                         )
                         .with_label(annot.span, "expected due to this annotation"),
                     );
                 }
                 expected
             }
-            // No annotation: infer from the initialiser.
             None => init,
         };
         self.tc.local_types.insert(l.id, ty);
@@ -603,7 +573,7 @@ impl Checker<'_> {
 
     // ---- expressions ----
 
-    /// Synthesises and records the type of an expression.
+    /// Infers and records the type of `expr`.
     fn check_expr(&mut self, expr: &Expr) -> Type {
         let ty = match &expr.kind {
             ExprKind::Int(_) => Type::Int,
@@ -638,7 +608,7 @@ impl Checker<'_> {
         match self.res.use_of(id) {
             Some(Res::Local(def)) => self.tc.local_type(def),
             Some(Res::Const(cid)) => self.tc.const_type(cid),
-            // A function or builtin name only has meaning as a call target.
+            // A function name is only valid as a call target.
             Some(Res::Fn(_)) | Some(Res::Builtin(_)) => {
                 self.diags.emit(
                     Diagnostic::error(
@@ -650,7 +620,7 @@ impl Checker<'_> {
                 );
                 Type::Error
             }
-            // Unresolved: resolution already reported it.
+            // Resolution already reported it.
             None => Type::Error,
         }
     }
@@ -676,52 +646,29 @@ impl Checker<'_> {
     fn check_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Type {
         let lt = self.check_expr(lhs);
         let rt = self.check_expr(rhs);
+        // Comparisons and logic are `bool` even when ill-typed, which limits
+        // cascading errors.
+        let yields_bool = op.is_comparison() || op.is_logical();
         if lt.is_error() || rt.is_error() {
-            // Result type still follows the operator category to limit cascades.
-            return if op.is_comparison() || op.is_logical() {
-                Type::Bool
-            } else {
-                Type::Error
-            };
+            return if yields_bool { Type::Bool } else { Type::Error };
         }
-        let span = lhs.span.to(rhs.span);
         use BinOp::*;
-        match op {
-            // `+` doubles as string concatenation when both sides are `str`.
-            Add if lt == Type::Str && rt == Type::Str => Type::Str,
-            Add | Sub | Mul | Div | Rem => {
-                if lt == rt && lt.is_numeric() {
-                    lt
-                } else {
-                    self.operand_error(op, lt, rt, span);
-                    Type::Error
-                }
-            }
-            Lt | Le | Gt | Ge => {
-                if lt == rt && lt.is_numeric() {
-                    Type::Bool
-                } else {
-                    self.operand_error(op, lt, rt, span);
-                    Type::Bool
-                }
-            }
-            Eq | Ne => {
-                // Equality is defined for any two equal, comparable types.
-                if lt == rt && !matches!(lt, Type::Unit) {
-                    Type::Bool
-                } else {
-                    self.operand_error(op, lt, rt, span);
-                    Type::Bool
-                }
-            }
-            And | Or => {
-                if matches!(lt, Type::Bool) && matches!(rt, Type::Bool) {
-                    Type::Bool
-                } else {
-                    self.operand_error(op, lt, rt, span);
-                    Type::Bool
-                }
-            }
+        let ok = match op {
+            // `+` also concatenates strings.
+            Add if lt == Type::Str && rt == Type::Str => return Type::Str,
+            Add | Sub | Mul | Div | Rem | Lt | Le | Gt | Ge => lt == rt && lt.is_numeric(),
+            Eq | Ne => lt == rt && lt != Type::Unit,
+            And | Or => lt == Type::Bool && rt == Type::Bool,
+        };
+        if !ok {
+            self.operand_error(op, lt, rt, lhs.span.to(rhs.span));
+        }
+        if yields_bool {
+            Type::Bool
+        } else if ok {
+            lt
+        } else {
+            Type::Error
         }
     }
 
@@ -736,11 +683,12 @@ impl Checker<'_> {
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Type {
-        // Calls are only valid on a function/builtin name (no function values).
+        // Only a function or builtin name can be called; there are no function
+        // values.
         if let ExprKind::Name(name) = &callee.kind {
             match self.res.use_of(callee.id) {
                 Some(Res::Fn(id)) => {
-                    let sig = self.tc.signatures[id.0 as usize].clone();
+                    let sig = self.tc.signature(id).clone();
                     self.check_args(&sig.params, args, &sig.name, span);
                     return sig.ret;
                 }
@@ -760,7 +708,7 @@ impl Checker<'_> {
                         .with_primary(callee.span, "cannot be called"),
                     );
                 }
-                None => {} // unresolved; already reported
+                None => {} // already reported by resolution
             }
         } else {
             let t = self.check_expr(callee);
@@ -771,14 +719,14 @@ impl Checker<'_> {
                 );
             }
         }
-        // Still type the arguments so their own errors surface.
+        // Check the arguments anyway, for their own errors.
         for arg in args {
             self.check_expr(arg);
         }
         Type::Error
     }
 
-    /// Checks call arity and per-argument types against a parameter list.
+    /// Checks the argument count and each argument's type against `params`.
     fn check_args(&mut self, params: &[Type], args: &[Expr], callee: &str, span: Span) {
         if params.len() != args.len() {
             self.diags.emit(
@@ -796,23 +744,21 @@ impl Checker<'_> {
         for (arg, &expected) in args.iter().zip(params) {
             let actual = self.check_expr(arg);
             if !actual.compatible(expected) {
-                self.diags.emit(
-                    Diagnostic::error(
-                        DiagCode::TypeMismatch,
-                        format!("argument to `{callee}` has the wrong type"),
-                    )
-                    .with_primary(arg.span, format!("expected `{expected}`, found `{actual}`")),
-                );
+                self.diags.emit(mismatch(
+                    format!("argument to `{callee}` has the wrong type"),
+                    arg.span,
+                    expected,
+                    actual,
+                ));
             }
         }
-        // Type any surplus arguments so their internal errors are still found.
+        // Surplus arguments still get checked, for their own errors.
         for arg in args.iter().skip(params.len()) {
             self.check_expr(arg);
         }
     }
 
-    /// Checks a call to a builtin whose signature is generic (currently only
-    /// `len`, which accepts any array).
+    /// Checks a call to a generic builtin; only `len`, which takes any array.
     fn check_generic_builtin(&mut self, builtin: Builtin, args: &[Expr], span: Span) -> Type {
         debug_assert!(matches!(builtin, Builtin::Len));
         if args.len() != 1 {
@@ -845,40 +791,31 @@ impl Checker<'_> {
         builtin.ret()
     }
 
+    /// Checks `target = value`.
+    ///
+    /// Arrays, structs, and tuples are shared by reference, so assigning to an
+    /// element or field mutates the shared value, not a binding, and needs no
+    /// `mut`. That is what lets a function mutate an array argument. Only
+    /// rebinding a variable requires `mut`.
     fn check_assign(&mut self, target: &Expr, value: &Expr) -> Type {
-        // Indexed assignment `a[i] = v` is a separate form of place expression.
-        if let ExprKind::Index { base, index } = &target.kind {
-            return self.check_index_assign(base, index, value);
-        }
-        // Field assignment `s.f = v` is another place form.
-        if let ExprKind::Field { base, field } = &target.kind {
-            return self.check_field_assign(base, field, value);
-        }
-        // Tuple element assignment `t.0 = v`.
-        if let ExprKind::TupleIndex {
-            base,
-            index,
-            index_span,
-        } = &target.kind
-        {
-            let elem_ty = self.check_tuple_index(base, *index, *index_span);
-            let value_ty = self.check_expr(value);
-            if !value_ty.compatible(elem_ty) && !elem_ty.is_error() {
-                self.diags.emit(
-                    Diagnostic::error(
-                        DiagCode::TypeMismatch,
-                        "mismatched types in tuple assignment",
-                    )
-                    .with_primary(
-                        value.span,
-                        format!("expected `{elem_ty}`, found `{value_ty}`"),
-                    ),
-                );
+        match &target.kind {
+            ExprKind::Index { base, index } => return self.check_index_assign(base, index, value),
+            ExprKind::Field { base, field } => {
+                let field_ty = self.check_field(base, field);
+                return self.check_store(field_ty, value, "field");
             }
-            return Type::Unit;
+            ExprKind::TupleIndex {
+                base,
+                index,
+                index_span,
+            } => {
+                let elem_ty = self.check_tuple_index(base, *index, *index_span);
+                return self.check_store(elem_ty, value, "tuple");
+            }
+            _ => {}
         }
         let value_ty = self.check_expr(value);
-        // The only valid assignment target is a mutable local.
+        // A variable must be a mutable local.
         if let ExprKind::Name(name) = &target.kind
             && let Some(Res::Local(def)) = self.res.use_of(target.id)
         {
@@ -897,20 +834,16 @@ impl Checker<'_> {
                     )),
                 );
             } else if !value_ty.compatible(target_ty) {
-                self.diags.emit(
-                    Diagnostic::error(
-                        DiagCode::TypeMismatch,
-                        format!("mismatched types assigning to `{name}`"),
-                    )
-                    .with_primary(
-                        value.span,
-                        format!("expected `{target_ty}`, found `{value_ty}`"),
-                    ),
-                );
+                self.diags.emit(mismatch(
+                    format!("mismatched types assigning to `{name}`"),
+                    value.span,
+                    target_ty,
+                    value_ty,
+                ));
             }
             return Type::Unit;
         }
-        // Not a place expression.
+        // Anything else is not assignable.
         if !self.check_expr(target).is_error() {
             self.diags.emit(
                 Diagnostic::error(DiagCode::InvalidAssignTarget, "invalid assignment target")
@@ -921,12 +854,6 @@ impl Checker<'_> {
     }
 
     /// Checks `base[index] = value`.
-    ///
-    /// Arrays have reference semantics, so mutating an *element* mutates the
-    /// shared referent rather than the binding. Element assignment is therefore
-    /// allowed regardless of the binding's `mut`-ness (only *rebinding* the
-    /// variable itself requires `mut`), which is what makes mutation through an
-    /// array parameter work.
     fn check_index_assign(&mut self, base: &Expr, index: &Expr, value: &Expr) -> Type {
         let base_ty = self.check_expr(base);
         let index_ty = self.check_expr(index);
@@ -938,59 +865,34 @@ impl Checker<'_> {
             DiagCode::TypeMismatch,
             "array index",
         );
-
-        match base_ty {
-            Type::Array(elem) => {
-                if !value_ty.compatible(elem.ty()) {
-                    self.diags.emit(
-                        Diagnostic::error(
-                            DiagCode::TypeMismatch,
-                            "mismatched types in element assignment",
-                        )
-                        .with_primary(
-                            value.span,
-                            format!("expected `{}`, found `{value_ty}`", elem.ty()),
-                        ),
-                    );
-                }
-            }
-            Type::Error => {}
-            other => {
-                self.diags.emit(
-                    Diagnostic::error(
-                        DiagCode::NotIndexable,
-                        format!("`{other}` cannot be indexed"),
-                    )
-                    .with_primary(base.span, "not an array"),
-                );
-            }
+        let elem_ty = self.indexed_elem(base_ty, base.span);
+        if !value_ty.compatible(elem_ty) {
+            self.diags.emit(mismatch(
+                "mismatched types in element assignment",
+                value.span,
+                elem_ty,
+                value_ty,
+            ));
         }
         Type::Unit
     }
 
-    /// Checks `base.field = value`. Like array elements, struct fields have
-    /// reference semantics, so the binding need not be `mut`.
-    fn check_field_assign(&mut self, base: &Expr, field: &Ident, value: &Expr) -> Type {
-        let field_ty = self.check_field(base, field);
+    /// Checks `value` against a field or tuple element of type `place_ty`.
+    fn check_store(&mut self, place_ty: Type, value: &Expr, what: &str) -> Type {
         let value_ty = self.check_expr(value);
-        if !value_ty.compatible(field_ty) && !field_ty.is_error() {
-            self.diags.emit(
-                Diagnostic::error(
-                    DiagCode::TypeMismatch,
-                    "mismatched types in field assignment",
-                )
-                .with_primary(
-                    value.span,
-                    format!("expected `{field_ty}`, found `{value_ty}`"),
-                ),
-            );
+        if !value_ty.compatible(place_ty) {
+            self.diags.emit(mismatch(
+                format!("mismatched types in {what} assignment"),
+                value.span,
+                place_ty,
+                value_ty,
+            ));
         }
         Type::Unit
     }
 
-    /// Checks a compound assignment `target op= value`. The target must be a
-    /// mutable local, and `target op value` must itself be well-typed and yield
-    /// the target's type.
+    /// Checks `target op= value`: the target must be a mutable local, and
+    /// `target op value` must have the target's (numeric) type.
     fn check_assign_op(&mut self, op: BinOp, target: &Expr, value: &Expr) -> Type {
         let target_ty = self.check_expr(target);
         let value_ty = self.check_expr(value);
@@ -1025,8 +927,7 @@ impl Checker<'_> {
                 .with_help(format!("declare it with `let mut {name}`")),
             );
         }
-        // The operator must be applicable: `target op value` must type-check and
-        // produce the target's type (compound assignment cannot change the type).
+        // Compound assignment cannot change the target's type.
         let operands_ok = target_ty.is_error()
             || value_ty.is_error()
             || (target_ty == value_ty && target_ty.is_numeric());
@@ -1036,7 +937,7 @@ impl Checker<'_> {
         Type::Unit
     }
 
-    /// Checks an array literal. All elements must share one primitive type.
+    /// Checks an array literal: a non-empty list of one primitive type.
     fn check_array_lit(&mut self, elems: &[Expr], span: Span) -> Type {
         if elems.is_empty() {
             self.diags.emit(
@@ -1053,13 +954,12 @@ impl Checker<'_> {
         for e in &elems[1..] {
             let t = self.check_expr(e);
             if !t.compatible(first) {
-                self.diags.emit(
-                    Diagnostic::error(
-                        DiagCode::TypeMismatch,
-                        "array elements have differing types",
-                    )
-                    .with_primary(e.span, format!("expected `{first}`, found `{t}`")),
-                );
+                self.diags.emit(mismatch(
+                    "array elements have differing types",
+                    e.span,
+                    first,
+                    t,
+                ));
             }
         }
         if first.is_error() {
@@ -1080,7 +980,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Checks an index expression `base[index]`.
+    /// Checks `base[index]`.
     fn check_index(&mut self, base: &Expr, index: &Expr) -> Type {
         let base_ty = self.check_expr(base);
         let index_ty = self.check_expr(index);
@@ -1091,6 +991,12 @@ impl Checker<'_> {
             DiagCode::TypeMismatch,
             "array index",
         );
+        self.indexed_elem(base_ty, base.span)
+    }
+
+    /// The element type of an array of type `base_ty`, reporting a base that is
+    /// not an array.
+    fn indexed_elem(&mut self, base_ty: Type, base_span: Span) -> Type {
         match base_ty {
             Type::Array(elem) => elem.ty(),
             Type::Error => Type::Error,
@@ -1100,17 +1006,18 @@ impl Checker<'_> {
                         DiagCode::NotIndexable,
                         format!("`{other}` cannot be indexed"),
                     )
-                    .with_primary(base.span, "not an array"),
+                    .with_primary(base_span, "not an array"),
                 );
                 Type::Error
             }
         }
     }
 
-    /// Checks a struct literal `Name { field: value, ... }`.
+    /// Checks `Name { field: value, ... }`: each declared field exactly once,
+    /// with the right type.
     fn check_struct_lit(&mut self, name: &Ident, fields: &[FieldInit], span: Span) -> Type {
         let Some(id) = self.res.structs.lookup(&name.name) else {
-            // Type the field values anyway so their own errors surface.
+            // Check the values anyway, for their own errors.
             for f in fields {
                 self.check_expr(&f.value);
             }
@@ -1125,7 +1032,7 @@ impl Checker<'_> {
         };
         let info = self.tc.struct_info(id).clone();
 
-        let mut provided: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut provided: HashSet<&str> = HashSet::new();
         for f in fields {
             let actual = self.check_expr(&f.value);
             match info.field(&f.name.name) {
@@ -1140,16 +1047,12 @@ impl Checker<'_> {
                         );
                     }
                     if !actual.compatible(expected) {
-                        self.diags.emit(
-                            Diagnostic::error(
-                                DiagCode::TypeMismatch,
-                                format!("field `{}` has the wrong type", f.name.name),
-                            )
-                            .with_primary(
-                                f.value.span,
-                                format!("expected `{expected}`, found `{actual}`"),
-                            ),
-                        );
+                        self.diags.emit(mismatch(
+                            format!("field `{}` has the wrong type", f.name.name),
+                            f.value.span,
+                            expected,
+                            actual,
+                        ));
                     }
                 }
                 None => {
@@ -1163,7 +1066,6 @@ impl Checker<'_> {
                 }
             }
         }
-        // Every declared field must be supplied.
         let missing: Vec<&str> = info
             .fields
             .iter()
@@ -1186,7 +1088,7 @@ impl Checker<'_> {
         Type::Struct(id.0)
     }
 
-    /// Checks field access `base.field`.
+    /// Checks `base.field`.
     fn check_field(&mut self, base: &Expr, field: &Ident) -> Type {
         let base_ty = self.check_expr(base);
         match base_ty {
@@ -1221,7 +1123,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Checks a tuple literal, interning its element types into a tuple type.
+    /// Checks a tuple literal.
     fn check_tuple_lit(&mut self, elems: &[Expr]) -> Type {
         let tys: Vec<Type> = elems.iter().map(|e| self.check_expr(e)).collect();
         if tys.iter().any(|t| t.is_error()) {
@@ -1230,7 +1132,7 @@ impl Checker<'_> {
         Type::Tuple(self.tc.intern_tuple(tys))
     }
 
-    /// Checks tuple element access `base.index`.
+    /// Checks `base.0`, `base.1`, ...
     fn check_tuple_index(&mut self, base: &Expr, index: usize, index_span: Span) -> Type {
         let base_ty = self.check_expr(base);
         match base_ty {
@@ -1281,8 +1183,7 @@ impl Checker<'_> {
             Some(else_branch) => {
                 let else_ty = self.check_expr(else_branch);
                 if then_ty.compatible(else_ty) {
-                    // Prefer the concrete type if one side is the error type.
-                    if then_ty.is_error() { else_ty } else { then_ty }
+                    join(then_ty, else_ty)
                 } else {
                     self.diags.emit(
                         Diagnostic::error(
@@ -1295,7 +1196,7 @@ impl Checker<'_> {
                     Type::Error
                 }
             }
-            // Without `else`, the `if` yields unit, so the then-branch must too.
+            // Without `else` the `if` is `unit`, so its block must be too.
             None => {
                 if !then_ty.compatible(Type::Unit) {
                     self.diags.emit(
@@ -1315,9 +1216,8 @@ impl Checker<'_> {
         }
     }
 
-    /// Checks a `match` expression: the scrutinee must be a scalar (`i64` or
-    /// `bool`), every pattern must match the scrutinee's type, all arm bodies
-    /// must share a type, and the arms together must be exhaustive.
+    /// Checks a `match`: an `i64` or `bool` scrutinee, patterns of its type, arms
+    /// of one type, and exhaustive coverage.
     fn check_match(&mut self, m: &MatchExpr, span: Span) -> Type {
         let scrut = self.check_expr(&m.scrutinee);
         let scalar = matches!(scrut, Type::Int | Type::Bool);
@@ -1347,13 +1247,7 @@ impl Checker<'_> {
             let body_ty = self.check_expr(&arm.body);
             result = Some(match result {
                 None => body_ty,
-                Some(prev) if prev.compatible(body_ty) => {
-                    if prev.is_error() {
-                        body_ty
-                    } else {
-                        prev
-                    }
-                }
+                Some(prev) if prev.compatible(body_ty) => join(prev, body_ty),
                 Some(prev) => {
                     self.diags.emit(
                         Diagnostic::error(
@@ -1368,8 +1262,7 @@ impl Checker<'_> {
             });
         }
 
-        // A `bool` match is exhaustive once both values appear; any match with a
-        // wildcard is exhaustive. Otherwise (notably `i64`) it is not.
+        // Only `_`, or both `true` and `false`, make a match exhaustive.
         let exhaustive = has_wild || (scrut == Type::Bool && saw_true && saw_false);
         if !scrut.is_error() && scalar && !exhaustive {
             self.diags.emit(
@@ -1383,7 +1276,7 @@ impl Checker<'_> {
         result.unwrap_or(Type::Unit)
     }
 
-    /// Checks one arm pattern against the scrutinee type.
+    /// Checks that `pattern` has the scrutinee's type.
     fn check_arm_pattern(&mut self, pattern: &Pattern, scrut: Type, span: Span) {
         let pat_ty = match pattern {
             Pattern::Int(_) => Type::Int,
@@ -1401,7 +1294,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Reports a mismatch if `actual` is not compatible with `expected`.
+    /// Reports `code` if `actual` is not compatible with `expected`.
     fn expect(&mut self, actual: Type, expected: Type, span: Span, code: DiagCode, what: &str) {
         if !actual.compatible(expected) {
             self.diags.emit(
@@ -1415,9 +1308,18 @@ impl Checker<'_> {
     }
 }
 
-/// A placeholder constant value of the given declared type, used after an error
-/// so that later phases (which only run on error-free programs) still see a
-/// consistently-typed value.
+/// A type-mismatch error labelled "expected `expected`, found `found`".
+fn mismatch(message: impl Into<String>, span: Span, expected: Type, found: Type) -> Diagnostic {
+    Diagnostic::error(DiagCode::TypeMismatch, message)
+        .with_primary(span, format!("expected `{expected}`, found `{found}`"))
+}
+
+/// The type of two compatible branches: the first, unless it is the error type.
+fn join(a: Type, b: Type) -> Type {
+    if a.is_error() { b } else { a }
+}
+
+/// A stand-in value of type `ty` for a constant whose value is unknown.
 fn default_const_value(ty: Type) -> ConstValue {
     match ty {
         Type::Float => ConstValue::Float(0.0),
@@ -1428,7 +1330,7 @@ fn default_const_value(ty: Type) -> ConstValue {
     }
 }
 
-/// Evaluates a unary operator over a constant value.
+/// `op v`, if defined on constants.
 fn eval_const_unary(op: UnOp, v: ConstValue) -> Option<ConstValue> {
     match (op, v) {
         (UnOp::Neg, ConstValue::Int(n)) => Some(ConstValue::Int(n.wrapping_neg())),
@@ -1438,62 +1340,39 @@ fn eval_const_unary(op: UnOp, v: ConstValue) -> Option<ConstValue> {
     }
 }
 
-/// Evaluates a binary operator over two constant values.
+/// `a op b`, if defined on constants.
 fn eval_const_binary(op: BinOp, a: ConstValue, b: ConstValue) -> Option<ConstValue> {
     use ConstValue::{Bool, Float, Int, Str};
-    Some(match (a, b) {
-        (Int(x), Int(y)) => match op {
-            BinOp::Add => Int(x.wrapping_add(y)),
-            BinOp::Sub => Int(x.wrapping_sub(y)),
-            BinOp::Mul => Int(x.wrapping_mul(y)),
-            BinOp::Div => Int(x.checked_div(y)?),
-            BinOp::Rem => Int(x.checked_rem(y)?),
-            BinOp::Eq => Bool(x == y),
-            BinOp::Ne => Bool(x != y),
-            BinOp::Lt => Bool(x < y),
-            BinOp::Le => Bool(x <= y),
-            BinOp::Gt => Bool(x > y),
-            BinOp::Ge => Bool(x >= y),
-            BinOp::And | BinOp::Or => return None,
-        },
-        (Float(x), Float(y)) => match op {
-            BinOp::Add => Float(x + y),
-            BinOp::Sub => Float(x - y),
-            BinOp::Mul => Float(x * y),
-            BinOp::Div => Float(x / y),
-            BinOp::Rem => Float(x % y),
-            BinOp::Eq => Bool(x == y),
-            BinOp::Ne => Bool(x != y),
-            BinOp::Lt => Bool(x < y),
-            BinOp::Le => Bool(x <= y),
-            BinOp::Gt => Bool(x > y),
-            BinOp::Ge => Bool(x >= y),
-            BinOp::And | BinOp::Or => return None,
-        },
+    match (a, b) {
+        (Int(x), Int(y)) => op
+            .fold_int(x, y)
+            .map(Int)
+            .or_else(|| op.compare(x, y).map(Bool)),
+        (Float(x), Float(y)) => op
+            .fold_float(x, y)
+            .map(Float)
+            .or_else(|| op.compare(x, y).map(Bool)),
         (Bool(x), Bool(y)) => match op {
-            BinOp::Eq => Bool(x == y),
-            BinOp::Ne => Bool(x != y),
-            BinOp::And => Bool(x && y),
-            BinOp::Or => Bool(x || y),
-            _ => return None,
+            BinOp::Eq => Some(Bool(x == y)),
+            BinOp::Ne => Some(Bool(x != y)),
+            BinOp::And => Some(Bool(x && y)),
+            BinOp::Or => Some(Bool(x || y)),
+            _ => None,
         },
         (Str(x), Str(y)) => match op {
-            BinOp::Eq => Bool(x == y),
-            BinOp::Ne => Bool(x != y),
-            _ => return None,
+            BinOp::Eq => Some(Bool(x == y)),
+            BinOp::Ne => Some(Bool(x != y)),
+            _ => None,
         },
-        _ => return None,
-    })
+        _ => None,
+    }
 }
 
-/// Whether control is guaranteed to leave `block` via `return` rather than
-/// falling off its end.
+/// Whether every path through `block` ends in a `return`.
 ///
-/// This is a deliberately simple, conservative analysis (no constant folding of
-/// conditions): a block diverges if any statement diverges, or if its tail
-/// expression diverges. It is used only to decide whether to check the
-/// fall-through value, so being conservative merely means occasionally checking
-/// a fall-through that cannot happen  never the reverse.
+/// Conservative: conditions are not evaluated, and loops are assumed to run
+/// zero times. A wrong `false` only means checking a fall-through value that
+/// cannot happen.
 fn block_diverges(block: &Block) -> bool {
     block.stmts.iter().any(stmt_diverges) || block.tail.as_deref().is_some_and(expr_diverges)
 }
@@ -1502,10 +1381,8 @@ fn stmt_diverges(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::Return(_) => true,
         StmtKind::Expr(e) => expr_diverges(e),
-        // A `let` diverges only if evaluating its initialiser does.
         StmtKind::Let(l) => expr_diverges(&l.init),
-        // Loops may execute zero times; `break`/`continue` transfer control
-        // within a loop, not out of the function. None guarantee divergence.
+        // Loops may run zero times; `break` and `continue` stay in the function.
         StmtKind::While(_)
         | StmtKind::For(_)
         | StmtKind::ForEach(_)
@@ -1517,7 +1394,7 @@ fn stmt_diverges(stmt: &Stmt) -> bool {
 fn expr_diverges(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Block(block) => block_diverges(block),
-        // An `if` diverges only when it has an `else` and both arms diverge.
+        // Only an `if` with an `else` can diverge, and only if both arms do.
         ExprKind::If(if_expr) => {
             let then_div = block_diverges(&if_expr.then_branch);
             let else_div = if_expr.else_branch.as_deref().is_some_and(expr_diverges);

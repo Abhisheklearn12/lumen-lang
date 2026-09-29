@@ -1,19 +1,15 @@
-//! The central registry of stable diagnostic codes.
+//! The registry of diagnostic codes.
 //!
-//! Every user-facing error carries a code from this enum. Keeping them in one
-//! place (rather than scattering string literals across phases) means codes are
-//! guaranteed unique, never silently reused, and easy to document. Codes are
-//! grouped by phase in blocks of one hundred:
+//! Every user-facing error carries a [`DiagCode`], grouped by phase:
 //!
-//! | Range          | Phase            |
-//! |----------------|------------------|
-//! | `E0001..`      | lexer            |
-//! | `E0100..`      | parser           |
-//! | `E0200..`      | name resolution  |
-//! | `E0300..`      | type checking    |
+//! | Codes   | Phase           |
+//! |---------|-----------------|
+//! | `E00xx` | lexer           |
+//! | `E01xx` | parser          |
+//! | `E02xx` | name resolution |
+//! | `E03xx` | type checking   |
 //!
-//! Codes are append-only: once shipped, a code's meaning is frozen so that
-//! users and tooling can rely on it.
+//! Codes are append-only: once shipped, a code keeps its meaning.
 
 /// A stable, user-visible diagnostic code such as `E0301`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,7 +19,7 @@ pub enum DiagCode {
     UnexpectedChar,
     /// A string literal without a closing quote.
     UnterminatedString,
-    /// A numeric literal that does not parse (e.g. `1.2.3`).
+    /// An integer literal too large for `i64`.
     InvalidNumber,
     /// A `/* */` comment without a closing `*/`.
     UnterminatedComment,
@@ -41,7 +37,7 @@ pub enum DiagCode {
     // ---- Name resolution (E02xx) ----
     /// A name was used but never declared in scope.
     UnresolvedName,
-    /// Two items/locals share a name where that is not allowed.
+    /// Two top-level items share a name.
     DuplicateDefinition,
     /// A function declares the same parameter name twice.
     DuplicateParameter,
@@ -65,7 +61,8 @@ pub enum DiagCode {
     AssignToImmutable,
     /// The program has no `main` function, or `main` has the wrong signature.
     BadMain,
-    /// `if` branches produced differing types in value position.
+    /// `if` or `match` branches with incompatible types, or an `if` without
+    /// `else` whose block is not `unit`.
     IfBranchMismatch,
     /// A type annotation named a type that does not exist.
     UnknownType,
@@ -75,22 +72,23 @@ pub enum DiagCode {
     BreakOutsideLoop,
     /// A `const` initialiser is not a compile-time constant expression.
     NotConstant,
-    /// An array element type is not a supported primitive.
+    /// An array element type that is not a primitive, or an empty array
+    /// literal.
     BadArrayType,
-    /// Indexing applied to a value that is not an array.
+    /// Indexing, or `for … in`, applied to a value that is not an array.
     NotIndexable,
-    /// Access to a field that the struct does not declare, or field access on a
-    /// non-struct value.
+    /// A struct field or tuple element that does not exist, or `.` on a value
+    /// that has neither.
     UnknownField,
-    /// A struct literal with missing, duplicate, extra, or unknown fields.
+    /// A struct literal that omits or repeats a field or names a non-struct, or
+    /// a struct declaring a field twice.
     BadStructLiteral,
     /// A `match` whose arms do not cover every possible value of the scrutinee.
     NonExhaustiveMatch,
 }
 
 impl DiagCode {
-    /// Every diagnostic code, in numeric order. Kept in sync with the enum so
-    /// tooling (the `explain` command, the uniqueness test) can iterate them.
+    /// Every code, in numeric order.
     pub const ALL: [DiagCode; 30] = {
         use DiagCode::*;
         [
@@ -178,7 +176,7 @@ impl std::fmt::Display for DiagCode {
 mod tests {
     use super::*;
 
-    /// Guards against two variants accidentally sharing a code string.
+    /// No two variants share a code string.
     #[test]
     fn codes_are_unique() {
         let mut seen = std::collections::HashSet::new();
@@ -191,7 +189,7 @@ mod tests {
         }
     }
 
-    /// The `ALL` array must list every code exactly once and in code order.
+    /// `ALL` is in code order.
     #[test]
     fn all_is_complete_and_sorted() {
         let codes: Vec<&str> = DiagCode::ALL.iter().map(|c| c.as_str()).collect();

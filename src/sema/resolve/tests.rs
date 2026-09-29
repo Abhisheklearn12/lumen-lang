@@ -99,8 +99,7 @@ fn let_initialiser_cannot_see_its_own_binding() {
 
 #[test]
 fn let_initialiser_sees_outer_binding_of_same_name() {
-    // Here the initialiser's `n` resolves to the parameter, and the new `n`
-    // shadows it afterwards  no errors.
+    // The initialiser's `n` is the parameter; the new `n` shadows it after.
     let (_ast, res, diags) = run("fn f(n: i64) -> i64 { let n = n; n }");
     assert!(!diags.has_errors());
     assert!(res.uses.values().all(|r| matches!(r, Res::Local(_))));

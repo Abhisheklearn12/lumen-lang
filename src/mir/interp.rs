@@ -1,33 +1,28 @@
-//! A direct interpreter for MIR.
+//! A MIR interpreter: a second execution engine, used to check the stack
+//! [VM](crate::backend::vm).
 //!
-//! This is a second execution engine: rather than generating bytecode and
-//! running it on the stack [`vm`](crate::backend::vm), it walks the MIR
-//! control-flow graph directly. Each call evaluates instructions into a flat
-//! register file, follows terminators between basic blocks, and recurses for
-//! function calls. Builtins are evaluated through the
-//! [shared module](crate::backend::builtins), so both engines produce identical
-//! output.
-//!
-//! Its main purpose is validation: a test runs a suite of programs through both
-//! engines and asserts they agree, which exercises the whole MIR pipeline
-//! (construction, optimization) against the trusted bytecode path. Because MIR
-//! instructions are untyped, arithmetic dispatches on the runtime [`Value`].
+//! It walks the control-flow graph with a register file per call, recursing
+//! on the host stack for calls, so very deep recursion can overflow it. MIR is
+//! untyped, so operators dispatch on the runtime [`Value`]. Builtins share the
+//! VM's [implementation](crate::backend::builtins), and a test asserts both
+//! engines agree on a suite of programs.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::backend::builtins;
-use crate::backend::bytecode::Value;
-use crate::backend::vm::{Execution, VmError, index_in_bounds};
+use crate::backend::bytecode::{Array, Value};
+use crate::backend::vm::{
+    DEFAULT_STEP_LIMIT, Execution, VmError, checked_div, checked_rem, index_in_bounds,
+};
 use crate::hir::{BinOp, Callee, UnOp};
 use crate::mir::*;
 use crate::sema::types::Builtin;
 
-/// A generous step budget mirroring the stack VM's, so runaway MIR also stops.
-const STEP_LIMIT: u64 = 50_000_000;
+/// The step budget, the same as the VM's, counted in blocks entered.
+const STEP_LIMIT: u64 = DEFAULT_STEP_LIMIT;
 
-/// Interprets a MIR program from its entry point, returning the result and any
-/// captured output.
+/// Runs `program` from `main`, returning its value and printed output.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn interpret(program: &Program) -> Result<Execution, VmError> {
     let mut interp = Interp {
@@ -49,7 +44,7 @@ struct Interp<'a> {
 }
 
 impl Interp<'_> {
-    /// Runs the function at `idx` with `args`, returning its result value.
+    /// Runs function `idx` on `args`.
     fn call(&mut self, idx: usize, args: Vec<Value>) -> Result<Value, VmError> {
         let func = self
             .program
@@ -92,7 +87,7 @@ impl Interp<'_> {
         }
     }
 
-    /// Executes a single instruction, updating the register file and locals.
+    /// Executes one instruction.
     fn exec(
         &mut self,
         inst: &Inst,
@@ -137,7 +132,7 @@ impl Interp<'_> {
     fn call_callee(&mut self, callee: Callee, args: Vec<Value>) -> Result<Value, VmError> {
         match callee {
             Callee::Fn(id) => self.call(id.0 as usize, args),
-            // `len` is a dedicated opcode in bytecode; here it is a normal call.
+            // The VM has an opcode for `len`, so `builtins::eval` lacks it.
             Callee::Builtin(Builtin::Len) => {
                 let arr = as_array(args.first().ok_or(VmError::Internal("len needs an arg"))?)?;
                 let len = arr.borrow().len() as i64;
@@ -231,8 +226,8 @@ fn eval_binary(op: BinOp, a: Value, b: Value) -> Result<Value, VmError> {
             BinOp::Add => Int(x.wrapping_add(y)),
             BinOp::Sub => Int(x.wrapping_sub(y)),
             BinOp::Mul => Int(x.wrapping_mul(y)),
-            BinOp::Div => Int(checked(x, y, |a, b| a.checked_div(b))?),
-            BinOp::Rem => Int(checked(x, y, |a, b| a.checked_rem(b))?),
+            BinOp::Div => Int(checked_div(x, y)?),
+            BinOp::Rem => Int(checked_rem(x, y)?),
             BinOp::Eq => Bool(x == y),
             BinOp::Ne => Bool(x != y),
             BinOp::Lt => Bool(x < y),
@@ -263,15 +258,6 @@ fn eval_binary(op: BinOp, a: Value, b: Value) -> Result<Value, VmError> {
     })
 }
 
-/// Applies a checked integer operation, mapping the failure cases to the same
-/// runtime errors the stack VM produces.
-fn checked(a: i64, b: i64, f: impl Fn(i64, i64) -> Option<i64>) -> Result<i64, VmError> {
-    if b == 0 {
-        return Err(VmError::DivisionByZero);
-    }
-    f(a, b).ok_or(VmError::IntegerOverflow)
-}
-
 fn as_int(v: &Value) -> Result<i64, VmError> {
     match v {
         Value::Int(n) => Ok(*n),
@@ -286,7 +272,7 @@ fn as_str(v: &Value) -> Result<Rc<str>, VmError> {
     }
 }
 
-fn as_array(v: &Value) -> Result<crate::backend::bytecode::Array, VmError> {
+fn as_array(v: &Value) -> Result<Array, VmError> {
     match v {
         Value::Array(a) => Ok(a.clone()),
         _ => Err(VmError::Internal("expected array")),

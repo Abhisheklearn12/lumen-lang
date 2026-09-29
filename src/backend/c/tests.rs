@@ -1,9 +1,6 @@
-//! Tests for the C backend.
-//!
-//! Where a C compiler is available, scalar programs are transpiled, compiled,
-//! run, and their output compared against the VM - proving the two backends
-//! agree. Where no compiler is present, the compile-and-run tests are skipped
-//! (the transpilation itself is still checked).
+//! Tests for the C backend. With a C compiler available, scalar programs are
+//! also compiled and run, and must print what the VM prints; without one, only
+//! the emitted C is checked.
 
 use crate::backend::{CError, VmError, emit_c, execute, generate};
 use crate::diagnostics::Diagnostics;
