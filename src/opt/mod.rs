@@ -127,12 +127,12 @@ pub(crate) fn is_pure(expr: &Expr) -> bool {
         // unused out-of-range read can be removed instead of trapping.
         ExprKind::ArrayLit(elems) => elems.iter().all(is_pure),
         ExprKind::StructLit(fields) => fields.iter().all(is_pure),
-        ExprKind::Index { base, index } => is_pure(base) && is_pure(index),
         ExprKind::GetField { base, .. } => is_pure(base),
         ExprKind::Call { .. }
         | ExprKind::Assign { .. }
         | ExprKind::SetIndex { .. }
-        | ExprKind::SetField { .. } => false,
+        | ExprKind::SetField { .. }
+        | ExprKind::Index { .. } => false,
     }
 }
 
