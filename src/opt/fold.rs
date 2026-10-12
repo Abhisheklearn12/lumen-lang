@@ -93,18 +93,21 @@ fn fold_binary(
     }
 
     // Identities. Test the operands first, so they can then be moved.
-    let l_zero = is_zero(&lhs.kind);
+    let l_izero = is_izero(&lhs.kind);
+
     let r_zero = is_zero(&rhs.kind);
+    let r_izero = is_izero(&rhs.kind);
+
     let l_one = is_one(&lhs.kind);
     let r_one = is_one(&rhs.kind);
     let l_bool = as_bool(&lhs.kind);
 
     match op {
         BinOp::Add => {
-            if r_zero {
+            if r_izero {
                 return Ok(*lhs);
             }
-            if l_zero {
+            if l_izero {
                 return Ok(*rhs);
             }
         }
@@ -121,10 +124,10 @@ fn fold_binary(
                 return Ok(*rhs);
             }
             // `x * 0` → `0` drops `x`, so only if it is pure.
-            if r_zero && is_pure(&lhs) {
+            if r_izero && is_pure(&lhs) {
                 return Ok(*rhs);
             }
-            if l_zero && is_pure(&rhs) {
+            if l_izero && is_pure(&rhs) {
                 return Ok(*lhs);
             }
         }
@@ -203,6 +206,10 @@ fn const_binary(op: BinOp, lhs: &ExprKind, rhs: &ExprKind) -> Option<ExprKind> {
 
 fn is_zero(kind: &ExprKind) -> bool {
     matches!(kind, ExprKind::Int(0)) || matches!(kind, ExprKind::Float(f) if *f == 0.0)
+}
+
+fn is_izero(kind: &ExprKind) -> bool {
+    matches!(kind, ExprKind::Int(0))
 }
 
 fn is_one(kind: &ExprKind) -> bool {
